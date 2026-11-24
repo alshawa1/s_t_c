@@ -1,487 +1,349 @@
-# -*- coding: utf-8 -*-
-"""
-modules/module9_operations_report.py
-───────────────────────────────────
-نظام مركز تقارير العمليات (Operations Reporting System):
-- الربط بين ملف المحفظة وملف السدادات / التحصيل بدقة كاملة وبدون أي تكرار
-- حساب التغطية كعدد عملاء فريدين بناءً على [تاريخ المتابعة] وفق الفترة (يومي / أسبوعي / شهري)
-- حساب التحصيل الدقيق من ملف السدادات مع تصفية التاريخ المحددة
-- حساب نسب التغطية ونسب التحصيل مقارنة بالمستهدفات
-- جدول التقرير التنفيذي:
-  المشرف | المحصل | التغطية | مستهدف التغطية | نسبة التغطية % | التحصيل | مستهدف التحصيل | نسبة التحصيل %
-"""
-
-from __future__ import annotations
 import logging
 import re
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Any
 import polars as pl
-import pandas as pd
-from core.utils import normalize_date_to_iso, normalize_date_series_to_iso
 
 _log = logging.getLogger("STC_OPS")
 
-_DEBT_COLS          = ["رقم المديونية", "رقم المديونيه", "رقم العقد", "رقم الحساب", "المديونية", "debt_id", "Debt ID", "Debt No.", "Account No.", "Account No"]
-_ID_COLS            = ["رقم الهوية", "الهوية", "هوية العميل", "السجل المدني", "ID", "customer_id", "Customer ID"]
-_SUPERVISOR_COLS     = ["المشرف", "اسم المشرف", "supervisor", "Supervisor"]
-_COLLECTOR_COLS      = ["المحصل", "اسم المحصل", "الموظف", "محصل", "collector", "Collector"]
-# نعتمد على كولومات تاريخ المتابعة والتواصل المختلفة
-_FOLLOWUP_DATE_COLS  = [
-    "تاريخ المتابعة", "تاريخ المتابعه",
-    "آخر متابعة للعميل", "أخر متابعة للعميل", "اخر متابعة للعميل",
-    "آخر متابعه للعميل", "أخر متابعه للعميل", "اخر متابعه للعميل",
-    "آخر متابعة", "أخر متابعة", "اخر متابعة",
-    "آخر متابعه", "أخر متابعه", "اخر متابعه",
-    "تاريخ آخر متابعة", "تاريخ أخر متابعة", "تاريخ اخر متابعة",
-    "تاريخ آخر متابعه", "تاريخ أخر متابعه", "تاريخ اخر متابعه",
-    "تاريخ التواصل", "تاريخ التغطية", "تاريخ التغطيه",
-    "تاريخ الاتصال", "تاريخ المكالمة", "تاريخ المكالمه",
-    "تاريخ العمل", "تاريخ الحركة", "تاريخ الاجراء", "تاريخ الإجراء",
-    "followup_date", "follow_up_date", "contact_date", "date", "Date"
-]
-_PAYMENT_AMOUNT_COLS = ["مبلغ السداد", "قيمة السداد", "المبلغ", "amount", "Amount", "paid_amount", "السدادات الموثقة", "Payment Amount"]
-_PAYMENT_DATE_COLS   = ["تاريخ السداد", "تاريخ الدفع", "تاريخ الحركة", "تاريخ العملية", "التاريخ", "date", "Date", "payment_date", "Payment Date"]
+_ID_COLS           = ["رقم الهوية", "الهوية", "الرقم الرئيسي", "رقم العميل", "رقم الحساب", "ID"]
+_BALANCE_COLS      = ["متبقي سداد موثق", "متبقي السداد الموثق", "متبقي سداد العقد", "مبلغ المديونية", "المديونية", "Balance"]
+_PAID_COLS         = ["السدادات الموثقة", "سدادات العقود", "مبلغ السداد", "Paid"]
+_PORTFOLIO_COLS     = ["المحافظ", "المحفظة", "اسم المحفظة", "Portfolio"]
+_SUPERVISOR_COLS    = ["المشرف", "اسم المشرف", "Supervisor"]
+_COLLECTOR_COLS     = ["المحصل", "اسم المحصل", "الموظف", "محصل", "Collector"]
+_USER_COLS          = ["اسم المستخدم", "اليوزر", "User", "user", "المستخدم"]
+_FOLLOWUP_DATE_COLS = ["تاريخ المتابعة", "تاريخ اخر متابعة", "آخر متابعة للعميل", "المتابعة", "Followup Date"]
+_MAIN_STATUS_COLS   = ["الحالة الرئيسية", "الحالة", "Main Status"]
+_SUB_STATUS_COLS    = ["الحالة الفرعية", "Sub Status"]
 
 
 def _detect(df: pl.DataFrame, candidates: List[str]) -> Optional[str]:
-    if df is None or len(df.columns) == 0:
-        return None
-    # 1. المطابقة التامة أولاً
     for c in candidates:
         if c in df.columns:
             return c
-    # 2. مطابقة جزئية مع استبعاد الكلمات العامة
-    for cand in candidates:
-        cand_clean = cand.strip().lower()
-        if len(cand_clean) < 4:
-            continue
-        for c in df.columns:
-            c_clean = c.strip().lower()
-            if cand_clean == c_clean or cand_clean in c_clean:
+    for c in df.columns:
+        for cand in candidates:
+            if cand in c or c in cand:
                 return c
     return None
 
 
-def _clean_str_id(val: Any) -> str:
-    if val is None or pd.isna(val):
-        return ""
-    s = str(val).strip()
-    if s.endswith(".0"):
-        s = s[:-2]
-    return s
-
-
-def _clean_float_val(val: Any) -> float:
-    if val is None or pd.isna(val):
-        return 0.0
-    try:
-        if isinstance(val, (int, float)):
-            return float(val)
-        s = str(val).replace(",", "").replace(" ", "").replace("﷼", "").strip()
-        return float(s) if s else 0.0
-    except:
-        return 0.0
-
-
-def parse_date_smart(val: Any) -> str:
-    """
-    تحويل التاريخ إلى YYYY-MM-DD بدقة عالية مع دعم:
-    - أرقام إكسيل التسلسلية (مثل 45000)
-    - التواريخ النصية D/M/Y و Y-M-D و M/D/Y
-    - النصوص التي تحوي أوقاتاً وساعات
-    """
-    return normalize_date_to_iso(val)
-
-
-def _detect_and_normalize_date_series(raw_list: List[Any]) -> List[str]:
-    return normalize_date_series_to_iso(raw_list)
-
-
-def _normalize_date_val(val: Any) -> str:
-    return parse_date_smart(val)
+def _clean_float(series: pl.Series) -> pl.Series:
+    return (
+        series
+        .cast(pl.String, strict=False)
+        .str.replace_all(",", "")
+        .str.strip_chars()
+        .cast(pl.Float64, strict=False)
+        .fill_null(0.0)
+    )
 
 
 class OperationsReportModule:
     """
-    مركز تقارير العمليات:
-    ربط المحفظة بالسدادات برقم المديونية وحساب التغطية (كعدد عملاء فريدين) والتحصيل الدقيق والمستهدفات.
+    نظام تقارير العمليات الاحترافي (Operations Reporting System - Reports Center)
+    يدعم إنشاء تقارير مستقلة بالكامل:
+    - 📅 Daily Report (تقرير يومي)
+    - 🗓 Weekly Report (تقرير أسبوعي)
+    - 📆 Monthly Report (تقرير شهري)
+    مع فلترة مخصصة وحساب دقيق للمؤشرات حسب نوع التقرير والفترة الزمنية المختارة دون تعديل البيانات الأصلية.
     """
 
     @staticmethod
-    def detect_available_dates(portfolio: pl.DataFrame) -> Dict[str, Any]:
-        """كشف التواريخ والأشهر المتاحة في عمود تاريخ المتابعة بالمحفظة"""
-        if portfolio is None or len(portfolio) == 0:
-            return {"dates": [], "latest_date": None, "top_date": None, "months": []}
-        followup_col = _detect(portfolio, _FOLLOWUP_DATE_COLS)
-        if not followup_col or followup_col not in portfolio.columns:
-            return {"dates": [], "latest_date": None, "top_date": None, "months": []}
-        raw_dates = portfolio[followup_col].drop_nulls().to_list()
-        norm_dates = [d for d in _detect_and_normalize_date_series(raw_dates) if d and re.match(r"^\d{4}-\d{2}-\d{2}$", d)]
-        if not norm_dates:
-            return {"dates": [], "latest_date": None, "top_date": None, "months": []}
-        from collections import Counter
-        counts = Counter(norm_dates)
-        sorted_dates = sorted(counts.keys(), reverse=True)
-        top_date = counts.most_common(1)[0][0] if counts else sorted_dates[0]
-        months = sorted(list(set(d[:7] for d in sorted_dates)), reverse=True)
-        return {
-            "dates": sorted_dates,
-            "latest_date": sorted_dates[0],
-            "top_date": top_date,
-            "months": months,
-            "date_counts": counts
-        }
-
-    @staticmethod
     def get_filter_options(portfolio: pl.DataFrame) -> Dict[str, List[str]]:
+        """يستخرج خيارات الفلاتر المتاحة من الملف لتغذية واجهة المستخدم"""
         if portfolio is None or len(portfolio) == 0:
             return {}
-        sup_col = _detect(portfolio, _SUPERVISOR_COLS)
-        col_col = _detect(portfolio, _COLLECTOR_COLS)
 
-        sups = []
-        if sup_col and sup_col in portfolio.columns:
-            sups = sorted([str(x).strip() for x in portfolio[sup_col].drop_nulls().unique().to_list() if str(x).strip() not in ('', 'nan', 'None')])
+        def _get_unique(col_name: Optional[str]) -> List[str]:
+            if not col_name or col_name not in portfolio.columns:
+                return []
+            s = (
+                portfolio[col_name]
+                .cast(pl.String, strict=False)
+                .str.strip_chars()
+                .drop_nulls()
+                .unique()
+                .sort()
+            )
+            result = [v for v in s.to_list() if v and str(v).strip() != ""]
+            return result
 
-        cols = []
-        if col_col and col_col in portfolio.columns:
-            cols = sorted([str(x).strip() for x in portfolio[col_col].drop_nulls().unique().to_list() if str(x).strip() not in ('', 'nan', 'None')])
-
-        return {"supervisors": sups, "collectors": cols}
+        return {
+            "supervisors": _get_unique(_detect(portfolio, _SUPERVISOR_COLS)),
+            "collectors": _get_unique(_detect(portfolio, _COLLECTOR_COLS)),
+            "portfolios": _get_unique(_detect(portfolio, _PORTFOLIO_COLS)),
+            "main_statuses": _get_unique(_detect(portfolio, _MAIN_STATUS_COLS)),
+            "sub_statuses": _get_unique(_detect(portfolio, _SUB_STATUS_COLS)),
+        }
 
     def run(
         self,
         portfolio: pl.DataFrame,
         payments: Optional[pl.DataFrame] = None,
-        report_mode: str = "daily",
-        target_date: Optional[Any] = None,
-        start_date: Optional[Any] = None,
-        end_date: Optional[Any] = None,
+        report_mode: str = "daily",  # "daily", "weekly", "monthly"
+        target_date: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
         month: Optional[int] = None,
         year: Optional[int] = None,
         supervisors: Optional[List[str]] = None,
-        coverage_target: float = 200.0,
-        collection_target: float = 50000.0,
-        supervisor_targets: Optional[Dict[str, Any]] = None,
-        **kwargs
+        collectors: Optional[List[str]] = None,
+        portfolios: Optional[List[str]] = None,
+        main_statuses: Optional[List[str]] = None,
+        sub_statuses: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
 
         if portfolio is None or len(portfolio) == 0:
-            raise ValueError("لم يتم رفع ملف المحفظة أو الملف فارغ!")
+            raise ValueError("ملف المحفظة فارغ أو غير ممرر")
 
-        # 1. كشف الأعمدة الحيوية في المحفظة
-        debt_col_port = _detect(portfolio, _DEBT_COLS)
-        cid_col_port  = _detect(portfolio, _ID_COLS)
+        # 1. كشف الأعمدة الأساسية
+        id_col        = _detect(portfolio, _ID_COLS)
+        bal_col       = _detect(portfolio, _BALANCE_COLS)
+        paid_col      = _detect(portfolio, _PAID_COLS)
+        prt_col       = _detect(portfolio, _PORTFOLIO_COLS)
         sup_col       = _detect(portfolio, _SUPERVISOR_COLS)
         col_col       = _detect(portfolio, _COLLECTOR_COLS)
+        usr_col       = _detect(portfolio, _USER_COLS)
         followup_col  = _detect(portfolio, _FOLLOWUP_DATE_COLS)
+        main_stat_col = _detect(portfolio, _MAIN_STATUS_COLS)
+        sub_stat_col  = _detect(portfolio, _SUB_STATUS_COLS)
 
-        # إذا لم يُعثر على عمود تاريخ المتابعة، نبحث عن أي عمود يحتوي على "تاريخ"
-        if not followup_col:
-            for c in portfolio.columns:
-                c_lower = c.strip().lower()
-                if "تاريخ" in c_lower or "date" in c_lower or "متابع" in c_lower:
-                    followup_col = c
-                    _log.info("⚡ تم اكتشاف عمود التاريخ تلقائياً: %s", followup_col)
-                    break
+        if not id_col or not prt_col or not col_col:
+            raise ValueError("لم يتم العثور على الأعمدة الأساسية للمحفظة (الهوية، المحفظة، المحصل)")
 
-        _log.info("🔍 الأعمدة المكتشفة: debt=%s | cid=%s | sup=%s | col=%s | followup=%s",
-                  debt_col_port, cid_col_port, sup_col, col_col, followup_col)
+        df_work = portfolio.clone()
 
-        if not col_col:
-            raise ValueError("لم يتم العثور على عمود المحصل في ملف المحفظة!")
-        if not debt_col_port:
-            debt_col_port = _detect(portfolio, _ID_COLS) or portfolio.columns[0]
+        # 2. تطبيق الفلاتر المخصصة من المستخدم (إن وجدت)
+        if supervisors and sup_col and sup_col in df_work.columns:
+            df_work = df_work.filter(pl.col(sup_col).cast(pl.String).str.strip_chars().is_in(supervisors))
+        if collectors and col_col and col_col in df_work.columns:
+            df_work = df_work.filter(pl.col(col_col).cast(pl.String).str.strip_chars().is_in(collectors))
+        if portfolios and prt_col and prt_col in df_work.columns:
+            df_work = df_work.filter(pl.col(prt_col).cast(pl.String).str.strip_chars().is_in(portfolios))
+        if main_statuses and main_stat_col and main_stat_col in df_work.columns:
+            df_work = df_work.filter(pl.col(main_stat_col).cast(pl.String).str.strip_chars().is_in(main_statuses))
+        if sub_statuses and sub_stat_col and sub_stat_col in df_work.columns:
+            df_work = df_work.filter(pl.col(sub_stat_col).cast(pl.String).str.strip_chars().is_in(sub_statuses))
 
-        df_p = portfolio.clone()
+        if len(df_work) == 0:
+            raise ValueError("لا توجد بيانات مطابقة للفلاتر المحددة!")
 
-        # 2. فلتر المشرفين (إن وُجد)
-        if supervisors and sup_col and sup_col in df_p.columns:
-            df_p = df_p.filter(pl.col(sup_col).cast(pl.String).str.strip_chars().is_in(supervisors))
-
-        if len(df_p) == 0:
-            raise ValueError("لا توجد بيانات مطابقة للمشرفين المحددين!")
-
-        # 3. توحيد وتحديد نطاق التغطية الزمني بناءً على [تاريخ المتابعة]
+        # 3. تحديد نوع التقرير والفترة الزمنية والتغطية
         today_obj = date.today()
-        report_mode = (report_mode or "daily").lower().strip()
+        report_mode = report_mode.lower().strip()
+        
+        report_title = ""
+        report_period_str = ""
 
-        if followup_col and followup_col in df_p.columns:
-            raw_dates = df_p[followup_col].to_list()
-            norm_dates = _detect_and_normalize_date_series(raw_dates)
-            followup_series = pl.Series(norm_dates)
-            # تشخيص: كم قيمة غير فارغة
-            non_empty = sum(1 for d in norm_dates if d)
-            _log.info("📅 عمود التاريخ '%s': %d صف، %d تاريخ صالح، أمثلة: %s",
-                      followup_col, len(norm_dates), non_empty,
-                      list(set(d for d in norm_dates if d))[:5])
-        else:
-            followup_series = pl.Series([""] * len(df_p))
-            _log.warning("⚠️ لم يُعثر على عمود تاريخ المتابعة — التغطية ستكون 0! أعمدة المحفظة: %s",
-                         list(df_p.columns[:20]))
-
-        if report_mode == "daily":
-            target_date_str = _normalize_date_val(target_date) if target_date else today_obj.strftime("%Y-%m-%d")
-            report_title = "📅 التقرير اليومي (Daily Report)"
-            report_period_str = f"تاريخ التقرير: {target_date_str}"
-            is_covered_expr = (followup_series == target_date_str)
-
-        elif report_mode == "weekly":
-            s_dt = _normalize_date_val(start_date) if start_date else (today_obj - timedelta(days=6)).strftime("%Y-%m-%d")
-            e_dt = _normalize_date_val(end_date) if end_date else today_obj.strftime("%Y-%m-%d")
-            # ضمان أن البداية والنهاية مرتبتان
-            if s_dt > e_dt:
-                s_dt, e_dt = e_dt, s_dt
-            report_title = "🗓 التقرير الأسبوعي (Weekly Report)"
-            report_period_str = f"الفترة: من {s_dt} إلى {e_dt}"
-            is_covered_expr = (followup_series >= s_dt) & (followup_series <= e_dt) & (followup_series != "")
-
-        elif report_mode == "monthly":
-            m_val = int(month) if month else today_obj.month
-            y_val = int(year) if year else today_obj.year
-            month_prefix = f"{y_val:04d}-{m_val:02d}"
-            report_title = "📆 التقرير الشهري (Monthly Report)"
-            report_period_str = f"فترة الشهر: {month_prefix} ({m_val}/{y_val})"
-            is_covered_expr = followup_series.str.starts_with(month_prefix)
-        else:
-            report_title = "📊 تقرير العمليات"
-            report_period_str = f"التاريخ: {today_obj.strftime('%Y-%m-%d')}"
-            is_covered_expr = pl.Series([True] * len(df_p))
-
-        # تنظيف معرفات المديونية ورقم الهوية لحساب عدد العملاء الفريدين
-        debt_expr = pl.col(debt_col_port).cast(pl.String).str.replace(r"\.0$", "", literal=False).str.strip_chars().alias("_clean_debt_id")
-        if cid_col_port and cid_col_port in df_p.columns:
-            cid_expr = (
-                pl.when(pl.col(cid_col_port).cast(pl.String).str.strip_chars().is_in(["", "null", "none", "nan", "-"]))
-                .then(pl.col(debt_col_port).cast(pl.String).str.strip_chars())
-                .otherwise(pl.col(cid_col_port).cast(pl.String).str.strip_chars())
-                .str.replace(r"\.0$", "", literal=False)
-                .alias("_clean_cid")
+        # تحويل تاريخ المتابعة لـ String YYYY-MM-DD
+        if followup_col and followup_col in df_work.columns:
+            followup_series_str = (
+                df_work[followup_col]
+                .cast(pl.String, strict=False)
+                .str.strip_chars()
+                .str.slice(0, 10)
             )
         else:
-            cid_expr = pl.col(debt_col_port).cast(pl.String).str.replace(r"\.0$", "", literal=False).str.strip_chars().alias("_clean_cid")
+            followup_series_str = pl.Series([today_obj.strftime("%Y-%m-%d")] * len(df_work))
 
-        df_p = df_p.with_columns([
-            is_covered_expr.cast(pl.Int32).alias("_is_covered"),
-            debt_expr,
-            cid_expr
+        # حساب التغطية بناءً على نوع التقرير
+        if report_mode == "daily":
+            if not target_date:
+                non_null_dates = followup_series_str.filter(followup_series_str.str.contains(r"^\d{4}-\d{2}-\d{2}$")).to_list()
+                target_date_str = max(non_null_dates) if non_null_dates else today_obj.strftime("%Y-%m-%d")
+            else:
+                target_date_str = str(target_date).strip()
+
+            report_title = "📅 التقرير اليومي (Daily Report)"
+            report_period_str = f"تاريخ التقرير: {target_date_str}"
+            is_covered_expr = (followup_series_str == target_date_str) | (followup_series_str.str.contains(target_date_str))
+
+        elif report_mode == "weekly":
+            if not start_date or not end_date:
+                e_dt = today_obj
+                s_dt = today_obj - timedelta(days=6)
+                start_date_str = s_dt.strftime("%Y-%m-%d")
+                end_date_str = e_dt.strftime("%Y-%m-%d")
+            else:
+                start_date_str = str(start_date).strip()
+                end_date_str = str(end_date).strip()
+
+            report_title = "🗓 التقرير الأسبوعي (Weekly Report)"
+            report_period_str = f"الفترة الأسبوعية: من {start_date_str} إلى {end_date_str}"
+            is_covered_expr = (followup_series_str >= start_date_str) & (followup_series_str <= end_date_str)
+
+        elif report_mode == "monthly":
+            m_val = month if month else today_obj.month
+            y_val = year if year else today_obj.year
+            month_prefix = f"{y_val:04d}-{m_val:02d}"
+
+            report_title = "📆 التقرير الشهري (Monthly Report)"
+            report_period_str = f"فترة الشهر: {month_prefix} ({m_val}/{y_val})"
+            is_covered_expr = followup_series_str.str.starts_with(month_prefix)
+        else:
+            report_title = "📊 تقرير العمليات"
+            report_period_str = f"تاريخ التقرير: {today_obj.strftime('%Y-%m-%d')}"
+            is_covered_expr = pl.Series([True] * len(df_work))
+
+        # 4. مبالغ المديونية والسداد
+        bal_series = _clean_float(df_work[bal_col]) if bal_col and bal_col in df_work.columns else pl.Series([0.0] * len(df_work))
+        paid_series = _clean_float(df_work[paid_col]) if paid_col and paid_col in df_work.columns else pl.Series([0.0] * len(df_work))
+
+        # معالجة ملف السدادات الإضافية إن وجد
+        payments_sum_map = {}
+        payments_cnt_map = {}
+        if payments is not None and len(payments) > 0:
+            pmt_id_col = _detect(payments, _ID_COLS)
+            pmt_amt_col = _detect(payments, _PAID_COLS) or _detect(payments, ["مبلغ السداد", "المبلغ", "Amount"])
+            if pmt_id_col and pmt_amt_col:
+                pmt_clean = payments.with_columns([
+                    pl.col(pmt_id_col).cast(pl.String).str.replace(r"\.0$", "", literal=False).str.strip_chars(),
+                    _clean_float(payments[pmt_amt_col]).alias("clean_pmt_amt")
+                ])
+                grp_pmt = pmt_clean.group_by(pmt_id_col).agg([
+                    pl.col("clean_pmt_amt").sum().alias("total_pmt"),
+                    pl.len().alias("count_pmt")
+                ])
+                for r in grp_pmt.iter_rows(named=True):
+                    payments_sum_map[str(r[pmt_id_col])] = float(r["total_pmt"])
+                    payments_cnt_map[str(r[pmt_id_col])] = int(r["count_pmt"])
+
+        if payments_sum_map:
+            ids_str = df_work[id_col].cast(pl.String).str.replace(r"\.0$", "", literal=False).str.strip_chars().to_list()
+            added_pmts = [payments_sum_map.get(i, 0.0) for i in ids_str]
+            added_cnts = [payments_cnt_map.get(i, 0) for i in ids_str]
+            total_paid_expr = paid_series + pl.Series(added_pmts)
+            has_paid_flag = (paid_series > 0).cast(pl.Int64)
+            count_paid_expr = pl.Series(added_cnts) + has_paid_flag
+        else:
+            total_paid_expr = paid_series
+            count_paid_expr = (paid_series > 0).cast(pl.Int64)
+
+        # إضافة الأعمدة التحليلية الجديدة على النسخة المفردة
+        df_out = df_work.with_columns([
+            pl.when(is_covered_expr).then(pl.lit("Covered")).otherwise(pl.lit("Not Covered")).alias("Coverage Status"),
+            pl.when(is_covered_expr).then(pl.lit(1)).otherwise(pl.lit(0)).alias("Coverage Value"),
+            pl.when(is_covered_expr).then(pl.lit("تمت التغطية")).otherwise(pl.lit("لم تتم التغطية")).alias("حالة التغطية"),
+            total_paid_expr.alias("إجمالي السداد التحليلي"),
+            count_paid_expr.alias("عدد عمليات السداد"),
+            (
+                pl.when(total_paid_expr + bal_series > 0)
+                .then((total_paid_expr / (total_paid_expr + bal_series)) * 100.0)
+                .otherwise(0.0)
+            ).alias("نسبة التحصيل %")
         ])
 
-        # 4. بناء خرائط الربط للمحصلين والمشرفين (لمنع أي تكرار أو إسقاط في التحصيل)
-        # مديونية -> (محصل, مشرف)
-        # هوية -> (محصل, مشرف)
-        debt_to_col: Dict[str, str] = {}
-        cid_to_col: Dict[str, str] = {}
-        collector_set = set()
+        # 5. حساب الـ Pivot Tables حصرياً للبيانات المفلترة والمحسوبة
+        pivot_supervisor  = self._build_group_summary(df_out, sup_col or col_col, "المشرف", bal_col)
+        pivot_collector   = self._build_group_summary(df_out, col_col, "المحصل", bal_col, usr_col=usr_col, sup_col=sup_col)
+        pivot_portfolio   = self._build_group_summary(df_out, prt_col, "المحافظ", bal_col)
+        pivot_main_status = self._build_group_summary(df_out, main_stat_col, "الحالة الرئيسية", bal_col) if main_stat_col else pl.DataFrame()
+        pivot_sub_status  = self._build_group_summary(df_out, sub_stat_col, "الحالة الفرعية", bal_col) if sub_stat_col else pl.DataFrame()
 
-        p_debts = df_p["_clean_debt_id"].to_list()
-        p_cids  = df_p["_clean_cid"].to_list()
-        p_cols  = [str(x).strip() for x in df_p[col_col].to_list()]
+        # 6. الترتيب Top 10
+        top10_supervisors = pivot_supervisor.filter(~pl.col("المشرف").str.contains("📊")).sort("نسبة التغطية %", descending=True).head(10) if not pivot_supervisor.is_empty() else pl.DataFrame()
+        top10_collectors  = pivot_collector.filter(~pl.col("المحصل").str.contains("📊")).sort("نسبة التغطية %", descending=True).head(10) if not pivot_collector.is_empty() else pl.DataFrame()
+        top10_portfolios  = pivot_portfolio.filter(~pl.col("المحافظ").str.contains("📊")).sort("متبقي سداد موثق", descending=True).head(10) if not pivot_portfolio.is_empty() else pl.DataFrame()
 
-        for d_id, c_id, c_name in zip(p_debts, p_cids, p_cols):
-            if d_id and d_id not in debt_to_col:
-                debt_to_col[d_id] = c_name
-            if c_id and c_id not in cid_to_col:
-                cid_to_col[c_id] = c_name
-            if c_name:
-                collector_set.add(c_name)
+        # 7. حساب الـ KPIs حصرياً للتخصيص الحالي
+        total_cust     = len(df_out)
+        covered_cust   = int(df_out["Coverage Value"].sum())
+        uncovered_cust = total_cust - covered_cust
+        cov_rate       = round((covered_cust / total_cust * 100), 2) if total_cust > 0 else 0.0
 
-        # 5. معالجة شيت السدادات / التحصيل بدقة كاملة وبدون أي تكرار
-        # كل عملية سداد تُحسب مرة واحدة فقط للمحصل المستحق
-        collector_payments: Dict[str, float] = {c: 0.0 for c in collector_set}
-
-        if payments is not None and len(payments) > 0:
-            pmt_debt_col = _detect(payments, _DEBT_COLS)
-            pmt_cid_col  = _detect(payments, _ID_COLS)
-            pmt_amt_col  = _detect(payments, _PAYMENT_AMOUNT_COLS)
-            pmt_dt_col   = _detect(payments, _PAYMENT_DATE_COLS)
-            pmt_collector_col = _detect(payments, _COLLECTOR_COLS)
-
-            if pmt_amt_col:
-                # تنظيف مبالغ السداد
-                p_clean_df = payments.with_columns([
-                    pl.col(pmt_amt_col).cast(pl.String, strict=False)
-                    .str.replace_all(",", "", literal=True)
-                    .str.replace_all(" ", "", literal=True)
-                    .str.replace_all("﷼", "", literal=True)
-                    .str.replace_all(r"[^\d\.-]", "", literal=False)
-                    .cast(pl.Float64, strict=False)
-                    .fill_null(0.0)
-                    .alias("_amt")
-                ])
-
-                # تصفية السدادات بالتاريخ إذا كان عمود التاريخ موجوداً
-                if pmt_dt_col and pmt_dt_col in p_clean_df.columns:
-                    raw_p_dates = p_clean_df[pmt_dt_col].to_list()
-                    norm_p_dates = _detect_and_normalize_date_series(raw_p_dates)
-                    p_clean_df = p_clean_df.with_columns(pl.Series("_p_date", norm_p_dates))
-
-                    # تصفية التحصيل بالتاريخ فقط في الوضع الأسبوعي والشهري
-                    # في الوضع اليومي: نأخذ كل السدادات المرتبطة بالمحفظة بدون فلتر تاريخ
-                    # لأن شيت التحصيل هو مصدر الحقيقة ومرتبط برقم المديونية فقط
-                    if report_mode == "weekly" and 's_dt' in locals() and 'e_dt' in locals():
-                        p_clean_df = p_clean_df.filter((pl.col("_p_date") >= s_dt) & (pl.col("_p_date") <= e_dt) & (pl.col("_p_date") != ""))
-                    elif report_mode == "monthly" and 'month_prefix' in locals():
-                        p_clean_df = p_clean_df.filter(pl.col("_p_date").str.starts_with(month_prefix))
-
-                # استخراج القوائم لإسناد كل سداد للمحصل التابع له بالضبط
-                p_amts = p_clean_df["_amt"].to_list()
-                p_debts_raw = [_clean_str_id(x) for x in p_clean_df[pmt_debt_col].to_list()] if pmt_debt_col else [""] * len(p_clean_df)
-                p_cids_raw  = [_clean_str_id(x) for x in p_clean_df[pmt_cid_col].to_list()] if pmt_cid_col else [""] * len(p_clean_df)
-                p_col_names = [str(x).strip() for x in p_clean_df[pmt_collector_col].to_list()] if pmt_collector_col else [""] * len(p_clean_df)
-
-                for amt, did, cid, c_name_direct in zip(p_amts, p_debts_raw, p_cids_raw, p_col_names):
-                    if amt <= 0.0:
-                        continue
-                    # البحث عن المحصل: 1. برقم المديونية -> 2. برقم الهوية -> 3. بالاسم المباشر في شيت السداد
-                    assigned_col = debt_to_col.get(did) or cid_to_col.get(cid) or (c_name_direct if c_name_direct in collector_set else None)
-                    if assigned_col:
-                        collector_payments[assigned_col] = collector_payments.get(assigned_col, 0.0) + amt
-
-        # 6. التجميع لبناء التقرير التنفيذي المطلوب
-        # التغطية: عدد العملاء الفريدين الذين تم التواصل معهم في الفترة المحددة
-        grp_cols = [sup_col, col_col] if sup_col and sup_col in df_p.columns else [col_col]
-
-        agg_summary = (
-            df_p.group_by(grp_cols)
-            .agg([
-                pl.col("_clean_cid").filter((pl.col("_is_covered") == 1) & (pl.col("_clean_cid") != "")).n_unique().alias("التغطية"),
-                pl.col("_clean_cid").filter(pl.col("_clean_cid") != "").n_unique().alias("إجمالي عملاء المحصل"),
-                pl.len().alias("إجمالي مديونيات المحصل")
-            ])
-            .sort(sup_col if sup_col and sup_col in df_p.columns else col_col)
-        )
-
-        rows: List[Dict[str, Any]] = []
-        supervisor_targets = supervisor_targets or {}
-
-        def_cov_tgt = float(coverage_target if coverage_target and coverage_target > 0 else 200.0)
-        def_col_tgt = float(collection_target if collection_target and collection_target > 0 else 50000.0)
-
-        if sup_col and sup_col in agg_summary.columns:
-            sup_groups: Dict[str, List[Dict[str, Any]]] = {}
-            for r in agg_summary.iter_rows(named=True):
-                s_name = str(r.get(sup_col) or "بدون مشرف").strip()
-                sup_groups.setdefault(s_name, []).append(r)
-
-            for s_name, cols_list in sup_groups.items():
-                s_custom = supervisor_targets.get(s_name, {}) if supervisor_targets else {}
-                cov_tgt_val = float(s_custom.get("coverage_target") or def_cov_tgt)
-                col_tgt_val = float(s_custom.get("collection_target") or def_col_tgt)
-
-                sup_tot_cov = 0.0
-                sup_tot_col = 0.0
-                sup_tot_cov_tgt = 0.0
-                sup_tot_col_tgt = 0.0
-
-                for c_item in cols_list:
-                    c_name = str(c_item.get(col_col) or "").strip()
-                    c_cov  = float(c_item.get("التغطية") or 0.0)
-                    # التحصيل الدقيق من collector_payments (بدون أي تكرار)
-                    c_col  = round(collector_payments.get(c_name, 0.0), 2)
-
-                    c_cov_pct = round((c_cov / cov_tgt_val * 100.0), 2) if cov_tgt_val > 0 else 0.0
-                    c_col_pct = round((c_col / col_tgt_val * 100.0), 2) if col_tgt_val > 0 else 0.0
-
-                    sup_tot_cov     += c_cov
-                    sup_tot_col     += c_col
-                    sup_tot_cov_tgt += cov_tgt_val
-                    sup_tot_col_tgt += col_tgt_val
-
-                    rows.append({
-                        "المشرف": s_name,
-                        "المحصل": c_name,
-                        "التغطية": int(c_cov),
-                        "مستهدف التغطية": int(cov_tgt_val),
-                        "نسبة التغطية %": c_cov_pct,
-                        "التحصيل": c_col,
-                        "مستهدف التحصيل": round(col_tgt_val, 2),
-                        "نسبة التحصيل %": c_col_pct,
-                        "_row_type": "collector"
-                    })
-
-                sup_cov_pct = round((sup_tot_cov / sup_tot_cov_tgt * 100.0), 2) if sup_tot_cov_tgt > 0 else 0.0
-                sup_col_pct = round((sup_tot_col / sup_tot_col_tgt * 100.0), 2) if sup_tot_col_tgt > 0 else 0.0
-
-                rows.append({
-                    "المشرف": f"إجمالي مشرف: {s_name}",
-                    "المحصل": f"({len(cols_list)} محصلين)",
-                    "التغطية": int(sup_tot_cov),
-                    "مستهدف التغطية": int(sup_tot_cov_tgt),
-                    "نسبة التغطية %": sup_cov_pct,
-                    "التحصيل": round(sup_tot_col, 2),
-                    "مستهدف التحصيل": round(sup_tot_col_tgt, 2),
-                    "نسبة التحصيل %": sup_col_pct,
-                    "_row_type": "subtotal"
-                })
-
-        else:
-            for c_item in agg_summary.iter_rows(named=True):
-                c_name = str(c_item.get(col_col) or "").strip()
-                c_cov  = float(c_item.get("التغطية") or 0.0)
-                c_col  = round(collector_payments.get(c_name, 0.0), 2)
-
-                c_cov_pct = round((c_cov / def_cov_tgt * 100.0), 2) if def_cov_tgt > 0 else 0.0
-                c_col_pct = round((c_col / def_col_tgt * 100.0), 2) if def_col_tgt > 0 else 0.0
-
-                rows.append({
-                    "المشرف": "-",
-                    "المحصل": c_name,
-                    "التغطية": int(c_cov),
-                    "مستهدف التغطية": int(def_cov_tgt),
-                    "نسبة التغطية %": c_cov_pct,
-                    "التحصيل": c_col,
-                    "مستهدف التحصيل": round(def_col_tgt, 2),
-                    "نسبة التحصيل %": c_col_pct,
-                    "_row_type": "collector"
-                })
-
-        # ── صف الإجمالي العام النهائي ──
-        grand_cov     = sum(r["التغطية"] for r in rows if r["_row_type"] == "collector")
-        grand_cov_tgt = sum(r["مستهدف التغطية"] for r in rows if r["_row_type"] == "collector")
-        grand_col     = sum(r["التحصيل"] for r in rows if r["_row_type"] == "collector")
-        grand_col_tgt = sum(r["مستهدف التحصيل"] for r in rows if r["_row_type"] == "collector")
-
-        grand_cov_pct = round((grand_cov / grand_cov_tgt * 100.0), 2) if grand_cov_tgt > 0 else 0.0
-        grand_col_pct = round((grand_col / grand_col_tgt * 100.0), 2) if grand_col_tgt > 0 else 0.0
-
-        rows.append({
-            "المشرف": "🌟 الإجمالي العام للمحفظة",
-            "المحصل": "الكل",
-            "التغطية": int(grand_cov),
-            "مستهدف التغطية": int(grand_cov_tgt),
-            "نسبة التغطية %": grand_cov_pct,
-            "التحصيل": round(grand_col, 2),
-            "مستهدف التحصيل": round(grand_col_tgt, 2),
-            "نسبة التحصيل %": grand_col_pct,
-            "_row_type": "grand_total"
-        })
-
-        df_report = pl.DataFrame(rows)
-
-        # إضافة عمود التحصيل في df_p للعرض التفصيلي
-        col_to_amt = [collector_payments.get(str(c).strip(), 0.0) for c in df_p[col_col].to_list()]
-        df_p = df_p.with_columns(pl.Series("_row_paid_amount", col_to_amt))
+        total_paid_val = round(float(df_out["إجمالي السداد التحليلي"].sum()), 2)
+        total_bal_val  = round(float(bal_series.sum()), 2)
+        paid_cnt_val   = int(df_out["عدد عمليات السداد"].sum())
+        avg_paid_val   = round(total_paid_val / paid_cnt_val, 2) if paid_cnt_val > 0 else 0.0
+        coll_rate      = round((total_paid_val / (total_paid_val + total_bal_val) * 100), 2) if (total_paid_val + total_bal_val) > 0 else 0.0
 
         stats = {
             "نوع التقرير": report_title,
             "الفترة الزمنية": report_period_str,
-            "إجمالي التغطية الفعلية": f"{int(grand_cov):,} عميل",
-            "مستهدف التغطية الكلي": f"{int(grand_cov_tgt):,} عميل",
-            "نسبة التغطية الكلية": f"{grand_cov_pct}%",
-            "إجمالي التحصيل الفعلي": f"{grand_col:,.2f} ﷼",
-            "مستهدف التحصيل الكلي": f"{grand_col_tgt:,.2f} ﷼",
-            "نسبة التحصيل الكلية": f"{grand_col_pct}%",
+            "إجمالي العملاء": total_cust,
+            "عدد العملاء المغطين": covered_cust,
+            "عدد العملاء غير المغطين": uncovered_cust,
+            "نسبة التغطية": f"{cov_rate}%",
+            "إجمالي السداد": f"{total_paid_val:,.2f} ريال",
+            "عدد عمليات السداد": paid_cnt_val,
+            "إجمالي متبقي السداد الموثق": f"{total_bal_val:,.2f} ريال",
+            "متوسط السداد": f"{avg_paid_val:,.2f} ريال",
+            "نسبة التحصيل": f"{coll_rate}%",
         }
 
         return {
             "report_mode": report_mode,
             "report_title": report_title,
             "report_period": report_period_str,
-            "report_table": df_report,
-            "data": df_p,
+            "data": df_out,
             "stats": stats,
-            "pivot_supervisor": df_report.filter(pl.col("_row_type") != "collector"),
-            "pivot_collector": df_report.filter(pl.col("_row_type") == "collector"),
+            "pivot_supervisor": pivot_supervisor,
+            "pivot_collector": pivot_collector,
+            "pivot_portfolio": pivot_portfolio,
+            "pivot_main_status": pivot_main_status,
+            "pivot_sub_status": pivot_sub_status,
+            "top10_supervisors": top10_supervisors,
+            "top10_collectors": top10_collectors,
+            "top10_portfolios": top10_portfolios,
         }
+
+    def _build_group_summary(
+        self,
+        df: pl.DataFrame,
+        group_col: Optional[str],
+        label: str,
+        bal_col: Optional[str],
+        usr_col: Optional[str] = None,
+        sup_col: Optional[str] = None,
+    ) -> pl.DataFrame:
+
+        if not group_col or group_col not in df.columns:
+            return pl.DataFrame()
+
+        grp_cols = [group_col]
+        if usr_col and usr_col in df.columns and group_col != usr_col:
+            grp_cols.append(usr_col)
+        if sup_col and sup_col in df.columns and group_col != sup_col:
+            grp_cols.append(sup_col)
+
+        bal_exp = _clean_float(df[bal_col]) if bal_col and bal_col in df.columns else pl.lit(0.0)
+
+        df_work = df.with_columns([
+            bal_exp.alias("_clean_bal")
+        ])
+
+        agg_df = (
+            df_work
+            .group_by(grp_cols)
+            .agg([
+                pl.len().alias("عدد العملاء"),
+                pl.col("Coverage Value").sum().alias("تمت التغطية"),
+                (pl.len() - pl.col("Coverage Value").sum()).alias("لم تتم التغطية"),
+                (pl.col("Coverage Value").sum() / pl.len() * 100.0).round(2).alias("نسبة التغطية %"),
+                pl.col("إجمالي السداد التحليلي").sum().round(2).alias("إجمالي السداد"),
+                pl.col("_clean_bal").sum().round(2).alias("متبقي سداد موثق"),
+            ])
+            .sort("عدد العملاء", descending=True)
+        )
+
+        agg_df = agg_df.rename({group_col: label})
+
+        total_row = {
+            label: f"📊 إجمالي {label}",
+            "عدد العملاء": int(agg_df["عدد العملاء"].sum()),
+            "تمت التغطية": int(agg_df["تمت التغطية"].sum()),
+            "لم تتم التغطية": int(agg_df["لم تتم التغطية"].sum()),
+            "نسبة التغطية %": round((float(agg_df["تمت التغطية"].sum()) / float(agg_df["عدد العملاء"].sum()) * 100.0), 2) if agg_df["عدد العملاء"].sum() > 0 else 0.0,
+            "إجمالي السداد": round(float(agg_df["إجمالي السداد"].sum()), 2),
+            "متبقي سداد موثق": round(float(agg_df["متبقي سداد موثق"].sum()), 2),
+        }
+        if usr_col and usr_col in grp_cols:
+            total_row[usr_col] = "-"
+        if sup_col and sup_col in grp_cols:
+            total_row[sup_col] = "-"
+
+        rows = agg_df.to_dicts()
+        rows.append(total_row)
+        return pl.DataFrame(rows, infer_schema_length=None)
