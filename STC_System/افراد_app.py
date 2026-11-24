@@ -463,8 +463,39 @@ def run_afrad_app():
         try:
             df = read_excel_calamine(file_path)
             from modules.module9_operations_report import OperationsReportModule
-            opts = OperationsReportModule.get_filter_options(df)
-            dates_info = OperationsReportModule.detect_available_dates(df)
+            opts = {}
+            if hasattr(OperationsReportModule, "get_filter_options"):
+                opts = OperationsReportModule.get_filter_options(df)
+            else:
+                sup_cols = ["المشرف", "اسم المشرف", "supervisor", "Supervisor"]
+                found_sup = next((c for c in sup_cols if c in df.columns), None)
+                opts["supervisors"] = sorted(df[found_sup].drop_nulls().cast(pl.String).unique().to_list()) if found_sup else []
+
+            if hasattr(OperationsReportModule, "detect_available_dates"):
+                dates_info = OperationsReportModule.detect_available_dates(df)
+            else:
+                dates_info = {"dates": [], "latest_date": None, "top_date": None, "months": []}
+                followup_cols = ["تاريخ المتابعة", "تاريخ الاتصال", "تاريخ العمل", "تاريخ الإجراء", "Follow up Date", "Followup Date", "Date"]
+                found_col = next((c for c in followup_cols if c in df.columns), None)
+                if found_col:
+                    try:
+                        from core.utils import normalize_date_series_to_iso
+                    except ImportError:
+                        from core.utils import normalize_date_series as normalize_date_series_to_iso
+                    import re
+                    raw_d = df[found_col].drop_nulls().to_list()
+                    norm_d = [d for d in normalize_date_series_to_iso(raw_d) if d and re.match(r"^\d{4}-\d{2}-\d{2}$", str(d))]
+                    if norm_d:
+                        from collections import Counter
+                        counts = Counter(norm_d)
+                        sorted_d = sorted(counts.keys(), reverse=True)
+                        dates_info = {
+                            "dates": sorted_d,
+                            "latest_date": sorted_d[0],
+                            "top_date": counts.most_common(1)[0][0] if counts else sorted_d[0],
+                            "months": sorted(list(set(d[:7] for d in sorted_d)), reverse=True),
+                            "date_counts": counts
+                        }
             opts["dates_info"] = dates_info
             return opts
         except Exception as e:
@@ -1398,20 +1429,42 @@ def run_afrad_app():
 
                     elif task_id == 9:
                         from modules.module9_operations_report import OperationsReportModule
+                        import inspect
                         pmt_df = dfs.get("payments")
-                        r = OperationsReportModule().run(
-                            portfolio,
-                            payments=pmt_df,
-                            report_mode=ops_params.get("report_mode", "daily"),
-                            target_date=ops_params.get("target_date"),
-                            start_date=ops_params.get("start_date"),
-                            end_date=ops_params.get("end_date"),
-                            month=ops_params.get("month"),
-                            year=ops_params.get("year"),
-                            supervisors=ops_params.get("supervisors"),
-                            coverage_target=ops_params.get("coverage_target", 200),
-                            collection_target=ops_params.get("collection_target", 50000),
-                        )
+                        _mod_inst = OperationsReportModule()
+                        _sig = inspect.signature(_mod_inst.run)
+                        _kwargs = {
+                            "payments": pmt_df,
+                            "report_mode": ops_params.get("report_mode", "daily"),
+                            "target_date": ops_params.get("target_date"),
+                            "start_date": ops_params.get("start_date"),
+                            "end_date": ops_params.get("end_date"),
+                            "month": ops_params.get("month"),
+                            "year": ops_params.get("year"),
+                            "supervisors": ops_params.get("supervisors"),
+                        }
+                        _has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in _sig.parameters.values())
+                        if "coverage_target" in _sig.parameters or _has_var_kw:
+                            _kwargs["coverage_target"] = ops_params.get("coverage_target", 200)
+                        if "collection_target" in _sig.parameters or _has_var_kw:
+                            _kwargs["collection_target"] = ops_params.get("collection_target", 50000)
+                        if "supervisor_targets" in _sig.parameters or _has_var_kw:
+                            _kwargs["supervisor_targets"] = ops_params.get("supervisor_targets")
+                        
+                        try:
+                            r = _mod_inst.run(portfolio, **_kwargs)
+                        except TypeError:
+                            r = _mod_inst.run(
+                                portfolio,
+                                payments=pmt_df,
+                                report_mode=ops_params.get("report_mode", "daily"),
+                                target_date=ops_params.get("target_date"),
+                                start_date=ops_params.get("start_date"),
+                                end_date=ops_params.get("end_date"),
+                                month=ops_params.get("month"),
+                                year=ops_params.get("year"),
+                                supervisors=ops_params.get("supervisors"),
+                            )
                         stats.update(r["stats"])
                         writer.write_operations_report(
                             report_table=r["report_table"],
