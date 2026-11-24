@@ -1398,20 +1398,42 @@ def run_afrad_app():
 
                     elif task_id == 9:
                         from modules.module9_operations_report import OperationsReportModule
+                        import inspect
                         pmt_df = dfs.get("payments")
-                        r = OperationsReportModule().run(
-                            portfolio,
-                            payments=pmt_df,
-                            report_mode=ops_params.get("report_mode", "daily"),
-                            target_date=ops_params.get("target_date"),
-                            start_date=ops_params.get("start_date"),
-                            end_date=ops_params.get("end_date"),
-                            month=ops_params.get("month"),
-                            year=ops_params.get("year"),
-                            supervisors=ops_params.get("supervisors"),
-                            coverage_target=ops_params.get("coverage_target", 200),
-                            collection_target=ops_params.get("collection_target", 50000),
-                        )
+                        _mod_inst = OperationsReportModule()
+                        _sig = inspect.signature(_mod_inst.run)
+                        _kwargs = {
+                            "payments": pmt_df,
+                            "report_mode": ops_params.get("report_mode", "daily"),
+                            "target_date": ops_params.get("target_date"),
+                            "start_date": ops_params.get("start_date"),
+                            "end_date": ops_params.get("end_date"),
+                            "month": ops_params.get("month"),
+                            "year": ops_params.get("year"),
+                            "supervisors": ops_params.get("supervisors"),
+                        }
+                        _has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in _sig.parameters.values())
+                        if "coverage_target" in _sig.parameters or _has_var_kw:
+                            _kwargs["coverage_target"] = ops_params.get("coverage_target", 200)
+                        if "collection_target" in _sig.parameters or _has_var_kw:
+                            _kwargs["collection_target"] = ops_params.get("collection_target", 50000)
+                        if "supervisor_targets" in _sig.parameters or _has_var_kw:
+                            _kwargs["supervisor_targets"] = ops_params.get("supervisor_targets")
+                        
+                        try:
+                            r = _mod_inst.run(portfolio, **_kwargs)
+                        except TypeError:
+                            r = _mod_inst.run(
+                                portfolio,
+                                payments=pmt_df,
+                                report_mode=ops_params.get("report_mode", "daily"),
+                                target_date=ops_params.get("target_date"),
+                                start_date=ops_params.get("start_date"),
+                                end_date=ops_params.get("end_date"),
+                                month=ops_params.get("month"),
+                                year=ops_params.get("year"),
+                                supervisors=ops_params.get("supervisors"),
+                            )
                         stats.update(r["stats"])
                         writer.write_operations_report(
                             report_table=r["report_table"],
