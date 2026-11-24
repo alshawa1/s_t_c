@@ -147,39 +147,55 @@ class DataLoader:
 
         t0 = time.time()
         try:
-            from python_calamine import CalamineWorkbook
-            wb = CalamineWorkbook.from_path(path)
-            sheet = wb.get_sheet_by_name(wb.sheet_names[0])
-            data = sheet.to_python()
-            if not data:
-                df = pl.DataFrame()
-            else:
-                headers = []
+            # 1. القراءة فائقة السرعة عبر محرك calamine المدمج في polars مباشرة
+            try:
+                raw_df = pl.read_excel(path, engine="calamine")
+                new_cols = {}
                 seen = {}
-                for i, h in enumerate(data[0]):
-                    h_str = str(h).strip() if h is not None else f"Column_{i}"
-                    if not h_str:
-                        h_str = f"Column_{i}"
-                    if h_str in seen:
-                        seen[h_str] += 1
-                        h_str = f"{h_str}_{seen[h_str]}"
+                for c in raw_df.columns:
+                    c_clean = str(c).strip() if c else "Column"
+                    if c_clean in seen:
+                        seen[c_clean] += 1
+                        new_cols[c] = f"{c_clean}_{seen[c_clean]}"
                     else:
-                        seen[h_str] = 0
-                    headers.append(h_str)
-                records = data[1:]
-                # Convert all values to strings to prevent mixed-type errors
-                # (e.g., some cells are numbers while others are empty strings)
-                str_records = [
-                    [str(cell) if cell is not None else "" for cell in row]
-                    for row in records
-                ]
-                df = pl.DataFrame(str_records, schema=headers, orient="row")
-            
-            # Clean column names (strip whitespace)
-            df = df.rename({c: c.strip() for c in df.columns})
-            
-            # Convert all columns to string representation first to avoid mixed types
-            df = df.select([pl.col(c).cast(pl.String).fill_null("") for c in df.columns])
+                        seen[c_clean] = 0
+                        new_cols[c] = c_clean
+                raw_df = raw_df.rename(new_cols)
+                df = raw_df.select([
+                    pl.col(c).cast(pl.String, strict=False).fill_null("").str.strip_chars().alias(c)
+                    for c in raw_df.columns
+                ])
+            except Exception as read_err:
+                logger.warning("محاولة القراءة بمحرك calamine البديل بسبب: %s", read_err)
+                from python_calamine import CalamineWorkbook
+                wb = CalamineWorkbook.from_path(path)
+                sheet = wb.get_sheet_by_name(wb.sheet_names[0])
+                data = sheet.to_python()
+                if not data:
+                    df = pl.DataFrame()
+                else:
+                    headers = []
+                    seen = {}
+                    for i, h in enumerate(data[0]):
+                        h_str = str(h).strip() if h is not None else f"Column_{i}"
+                        if not h_str:
+                            h_str = f"Column_{i}"
+                        if h_str in seen:
+                            seen[h_str] += 1
+                            h_str = f"{h_str}_{seen[h_str]}"
+                        else:
+                            seen[h_str] = 0
+                        headers.append(h_str)
+                    records = data[1:]
+                    str_records = [
+                        [str(cell) if cell is not None else "" for cell in row]
+                        for row in records
+                    ]
+                    df = pl.DataFrame(str_records, schema=headers, orient="row")
+                
+                # Clean column names (strip whitespace)
+                df = df.rename({c: c.strip() for c in df.columns})
+                df = df.select([pl.col(c).cast(pl.String).fill_null("") for c in df.columns])
 
             # Pre-emptively format key columns as cleaned text and amount/payment columns as numbers
             for col in df.columns:
