@@ -9,6 +9,8 @@ from datetime import date, datetime
 from typing import Dict, List, Optional
 
 import math
+import re
+import pandas as pd
 from dateutil import parser as dateutil_parser
 
 # ─── Logging ────────────────────────────────────────────────────────────────
@@ -47,26 +49,114 @@ def _is_nan(value) -> bool:
     return False
 
 
-def parse_date(value) -> Optional[date]:
+def normalize_date_to_iso(value, dayfirst: bool = True) -> str:
     """
-    Safely parse any date-like value (datetime, str, None …)
-    Returns a date object or None.
+    تحويل أي تاريخ إلى صيغة 'YYYY-MM-DD' بدقة متناهية.
+    يدعم:
+      - كائنات date و datetime
+      - أرقام إكسيل التسلسلية (مثل 45510 و 45510.5)
+      - صيغ ISO (YYYY-MM-DD و YYYY-MM-DD HH:MM:SS و YYYY-MM-DDTHH:MM:SS)
+      - صيغ DD/MM/YYYY و MM/DD/YYYY حسب dayfirst (أو عند وضوح اليوم > 12)
+    يرجع نص فارغ '' إذا كانت القيمة غير صالحة.
     """
     if _is_nan(value):
+        return ""
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%Y-%m-%d")
+    
+    s = str(value).strip()
+    if not s or s.lower() in ("none", "nan", "null", "nat", "-", "0", "0.0", "غير محدد"):
+        return ""
+
+    # 1. أرقام إكسيل التسلسلية (float / int / string)
+    try:
+        f = float(s)
+        if 20000 <= f <= 75000:
+            dt = pd.to_datetime(f, unit="D", origin="1899-12-30")
+            return dt.strftime("%Y-%m-%d")
+        elif 1980 <= f <= 2045:
+            return f"{int(f):04d}-01-01"
+    except (ValueError, OverflowError):
+        pass
+
+    # 2. صيغ ISO القياسية (مع إمكانية وجود وقت أو حرف T)
+    m_iso = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", s)
+    if m_iso:
+        y, m, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
+        if 1980 <= y <= 2045 and 1 <= m <= 12 and 1 <= d <= 31:
+            return f"{y:04d}-{m:02d}-{d:02d}"
+
+    # 3. إزالة الوقت من النص قبل الفحص
+    s_date = re.split(r"[T\s]", s)[0].strip()
+
+    # 4. صيغ DD/MM/YYYY أو MM/DD/YYYY
+    m_dmy = re.match(r"^(\d{1,2})[-/\.](\d{1,2})[-/\.](\d{4})$", s_date)
+    if m_dmy:
+        part1, part2, y = int(m_dmy.group(1)), int(m_dmy.group(2)), int(m_dmy.group(3))
+        if 1980 <= y <= 2045:
+            # إذا كان الجزء الأول أكبر من 12 فهو يقيناً اليوم (DD/MM/YYYY)
+            if part1 > 12 and 1 <= part2 <= 12 and 1 <= part1 <= 31:
+                return f"{y:04d}-{part2:02d}-{part1:02d}"
+            # إذا كان الجزء الثاني أكبر من 12 فهو يقيناً اليوم (MM/DD/YYYY)
+            elif part2 > 12 and 1 <= part1 <= 12 and 1 <= part2 <= 31:
+                return f"{y:04d}-{part1:02d}-{part2:02d}"
+            # في حال اللبس (كلاهما <= 12): نستخدم dayfirst المكتشف للعمود
+            elif dayfirst and 1 <= part1 <= 31 and 1 <= part2 <= 12:
+                return f"{y:04d}-{part2:02d}-{part1:02d}"
+            elif (not dayfirst) and 1 <= part1 <= 12 and 1 <= part2 <= 31:
+                return f"{y:04d}-{part1:02d}-{part2:02d}"
+
+    # 5. محاولة إضافية عبر dateutil
+    try:
+        dt = dateutil_parser.parse(s_date, dayfirst=dayfirst)
+        if 1980 <= dt.year <= 2045:
+            return dt.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+
+    return ""
+
+
+def normalize_date_series_to_iso(values) -> List[str]:
+    """
+    توحيد عمود تواريخ كامل إلى صيغة 'YYYY-MM-DD' مع الكشف التلقائي الذكي
+    لنمط العمود (هل هو DD/MM/YYYY أم MM/DD/YYYY) بناءً على القيم غير الملتبسة (> 12).
+    """
+    dmy_evidence = 0
+    mdy_evidence = 0
+    pat = re.compile(r"^(\d{1,2})[-/\.](\d{1,2})[-/\.](\d{4})")
+
+    for v in values:
+        if v is None or isinstance(v, (datetime, date)):
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        m = pat.match(s)
+        if m:
+            p1, p2 = int(m.group(1)), int(m.group(2))
+            if p1 > 12 and 1 <= p2 <= 12:
+                dmy_evidence += 1
+            elif p2 > 12 and 1 <= p1 <= 12:
+                mdy_evidence += 1
+
+    prefer_dayfirst = (dmy_evidence >= mdy_evidence)
+    return [normalize_date_to_iso(v, dayfirst=prefer_dayfirst) for v in values]
+
+
+def parse_date(value) -> Optional[date]:
+    """
+    Safely parse any date-like value (datetime, str, Excel serial, None …)
+    Returns a date object or None.
+    """
+    iso_str = normalize_date_to_iso(value)
+    if not iso_str:
         return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            return None
-        try:
-            return dateutil_parser.parse(value, dayfirst=True).date()
-        except Exception:
-            return None
-    return None
+    try:
+        parts = iso_str.split("-")
+        return date(int(parts[0]), int(parts[1]), int(parts[2]))
+    except Exception:
+        return None
 
 
 def days_since(value) -> Optional[int]:
