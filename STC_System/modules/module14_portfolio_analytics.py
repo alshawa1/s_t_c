@@ -167,6 +167,9 @@ class StrategicPortfolioModule:
         self,
         portfolio: Any,
         payments: Optional[Any] = None,
+        calls: Optional[Any] = None,
+        calls_duration_col: Optional[str] = None,
+        calls_success_threshold: int = 30,
         date_from: Optional[Any] = None,
         date_to: Optional[Any] = None,
         supervisors: Optional[List[str]] = None,
@@ -822,8 +825,239 @@ class StrategicPortfolioModule:
                     "all_members": sorted_team
                 }
 
+
+        # ── 16. تحليل المكالمات الفعلية (اختياري) ──
+        calls_analysis = {}
+        has_calls = False
+
+        if calls is not None:
+            # تحويل إلى pandas
+            if isinstance(calls, pl.DataFrame):
+                df_calls = calls.to_pandas()
+            elif isinstance(calls, pd.DataFrame):
+                df_calls = calls.copy()
+            else:
+                df_calls = pd.DataFrame(calls)
+
+            if len(df_calls) > 0:
+                has_calls = True
+                _CALL_DEBT_COLS  = ["رقم المديونية", "رقم المديونيه", "رقم العقد", "رقم الحساب",
+                                    "debt_id", "Debt ID", "AccountNo", "Account No"]
+                _CALL_DUR_COLS   = ["مدة المكالمة", "المدة", "duration", "Duration", "call_duration",
+                                    "مدة", "وقت المكالمة", "الوقت", "seconds", "Seconds", "ثانية"]
+                _CALL_STATUS_COLS= ["حالة المكالمة", "الحالة", "status", "Status", "call_status",
+                                    "نجاح", "نتيجة المكالمة", "result"]
+                _CALL_AGENT_COLS = ["المحصل", "اسم المحصل", "الموظف", "المندوب", "agent", "Agent",
+                                    "collector", "Collector", "user", "User"]
+                _CALL_SUP_COLS   = ["المشرف", "اسم المشرف", "supervisor", "Supervisor"]
+
+                # استخدام العمود الذي اختاره المستخدم أولاً، ثم Auto-detect
+                call_debt_col  = _detect_col(df_calls, _CALL_DEBT_COLS)
+                call_dur_col   = calls_duration_col if (calls_duration_col and calls_duration_col in df_calls.columns)                                  else _detect_col(df_calls, _CALL_DUR_COLS)
+                call_status_col= _detect_col(df_calls, _CALL_STATUS_COLS)
+                call_agent_col = _detect_col(df_calls, _CALL_AGENT_COLS)
+                call_sup_col   = _detect_col(df_calls, _CALL_SUP_COLS)
+
+                total_calls = len(df_calls)
+                threshold   = int(calls_success_threshold) if calls_success_threshold else 30
+
+                # ── دالة تحليل مدة المكالمة ──
+                def parse_duration(val):
+                    val = str(val).strip()
+                    # HH:MM:SS
+                    m = re.match(r"^(\d+):(\d+):(\d+)$", val)
+                    if m:
+                        return int(m.group(1))*3600 + int(m.group(2))*60 + int(m.group(3))
+                    # MM:SS
+                    m = re.match(r"^(\d+):(\d+)$", val)
+                    if m:
+                        return int(m.group(1))*60 + int(m.group(2))
+                    # >30 or <30
+                    m = re.match(r"^[><]?=?\s*(\d+)", val)
+                    if m:
+                        return int(m.group(1))
+                    try:
+                        return float(re.sub(r"[^\d.]", "", val))
+                    except Exception:
+                        return 0.0
+
+                # ── تحديد المكالمات الناجحة ──
+                successful_mask = pd.Series([False] * total_calls, index=df_calls.index)
+                durations_series = pd.Series([0.0] * total_calls, index=df_calls.index)
+
+                if call_dur_col:
+                    raw_dur_str = df_calls[call_dur_col].astype(str).str.strip()
+                    is_gt_notation = raw_dur_str.str.startswith(">")
+                    is_lt_notation = raw_dur_str.str.startswith("<")
+                    durations_parsed  = df_calls[call_dur_col].apply(parse_duration)
+                    durations_series  = durations_parsed.astype(float)
+                    successful_mask   = ((durations_series > threshold) | is_gt_notation) & ~is_lt_notation
+                elif call_status_col:
+                    success_keywords  = ["ناجح", "ناجحة", "نجاح", "completed", "success",
+                                         "answered", "connected", "مكتملة", "تم التوصل", "1", "yes", "نعم"]
+                    status_lower = df_calls[call_status_col].astype(str).str.lower().str.strip()
+                    for kw in success_keywords:
+                        successful_mask = successful_mask | status_lower.str.contains(kw, na=False)
+                else:
+                    successful_mask = pd.Series([True] * total_calls, index=df_calls.index)
+
+                df_success = df_calls[successful_mask].copy()
+                total_successful  = int(len(df_success))
+                total_failed      = total_calls - total_successful
+                success_rate      = round(total_successful / total_calls * 100, 2) if total_calls > 0 else 0.0
+
+                # متوسطات المدة (كلية)
+                avg_dur_all     = round(float(durations_series.mean()), 1) if call_dur_col else None
+                avg_dur_success = None
+                if call_dur_col and total_successful > 0:
+                    avg_dur_success = round(float(durations_series[successful_mask].mean()), 1)
+
+                # ── ربط المكالمات بالمحفظة ──
+                call_debt_counts: Dict[str, int] = {}
+                if call_debt_col:
+                    for debt_val in df_success[call_debt_col].astype(str).str.strip():
+                        d = re.sub(r"\.0$", "", debt_val)
+                        if d and d not in ("nan", "none", "null", ""):
+                            call_debt_counts[d] = call_debt_counts.get(d, 0) + 1
+
+                # ── تجميع حسب المحصل والمشرف ──
+                collector_call_stats: Dict[str, dict] = {}
+
+                if call_agent_col:
+                    for agent_val, grp in df_calls.groupby(df_calls[call_agent_col].astype(str).str.strip()):
+                        if not agent_val or agent_val in ("nan", "none", ""):
+                            continue
+                        total_ag   = len(grp)
+                        success_ag = int(successful_mask.loc[grp.index].sum())
+                        # متوسط مدة المكالمات الناجحة لهذا المحصل
+                        if call_dur_col and success_ag > 0:
+                            succ_idx   = grp.index[successful_mask.loc[grp.index]]
+                            avg_ag_dur = round(float(durations_series.loc[succ_idx].mean()), 1)
+                            max_ag_dur = round(float(durations_series.loc[succ_idx].max()), 1)
+                        else:
+                            avg_ag_dur = None
+                            max_ag_dur = None
+                        sup_val = ""
+                        if call_sup_col:
+                            sup_vals = grp[call_sup_col].astype(str).str.strip().dropna()
+                            sup_val  = sup_vals.mode()[0] if len(sup_vals) > 0 else ""
+                        collector_call_stats[agent_val] = {
+                            "المحصل":                agent_val,
+                            "المشرف":                sup_val,
+                            "إجمالي المكالمات":      total_ag,
+                            "المكالمات الناجحة":     success_ag,
+                            "المكالمات غير الناجحة": total_ag - success_ag,
+                            "نسبة النجاح %":         round(success_ag / total_ag * 100, 2) if total_ag > 0 else 0.0,
+                            "متوسط مدة الناجحة (ث)": avg_ag_dur,
+                            "أطول مكالمة ناجحة (ث)": max_ag_dur,
+                        }
+
+                # لو مفيش عمود محصل، نربط برقم المديونية مع حساب متوسطات المدة
+                if not collector_call_stats and call_debt_col:
+                    # خريطة سريعة للمشرف حسب رقم المديونية
+                    debt_to_sup = {}
+                    if "_supervisor" in df_p.columns:
+                        for did_p, sup_p in zip(df_p["_debt_clean"], df_p["_supervisor"]):
+                            if did_p and did_p not in debt_to_sup:
+                                debt_to_sup[did_p] = str(sup_p)
+
+                    col_succ_durs: Dict[str, List[float]] = {}
+                    raw_debts_list = df_calls[call_debt_col].astype(str).str.strip().tolist()
+                    succ_list = successful_mask.tolist()
+                    durs_list = durations_series.tolist()
+
+                    for raw_d, is_succ, dur_v in zip(raw_debts_list, succ_list, durs_list):
+                        did = re.sub(r"\.0$", "", raw_d)
+                        if not did or did in ("nan", "none", "null", ""):
+                            continue
+                        col_name = debt_to_col.get(did, "")
+                        if not col_name:
+                            continue
+                        sup_name = debt_to_sup.get(did, "")
+                        if col_name not in collector_call_stats:
+                            collector_call_stats[col_name] = {
+                                "المحصل": col_name, "المشرف": sup_name,
+                                "إجمالي المكالمات": 0, "المكالمات الناجحة": 0,
+                                "المكالمات غير الناجحة": 0, "نسبة النجاح %": 0.0,
+                                "متوسط مدة الناجحة (ث)": None, "أطول مكالمة ناجحة (ث)": None,
+                            }
+                            col_succ_durs[col_name] = []
+                        collector_call_stats[col_name]["إجمالي المكالمات"] += 1
+                        if is_succ:
+                            collector_call_stats[col_name]["المكالمات الناجحة"] += 1
+                            if call_dur_col:
+                                col_succ_durs[col_name].append(float(dur_v))
+
+                    for col_name in collector_call_stats:
+                        t = collector_call_stats[col_name]["إجمالي المكالمات"]
+                        s = collector_call_stats[col_name]["المكالمات الناجحة"]
+                        collector_call_stats[col_name]["المكالمات غير الناجحة"] = t - s
+                        collector_call_stats[col_name]["نسبة النجاح %"] = round(s/t*100, 2) if t > 0 else 0.0
+                        d_list = col_succ_durs.get(col_name, [])
+                        if call_dur_col and d_list:
+                            collector_call_stats[col_name]["متوسط مدة الناجحة (ث)"] = round(sum(d_list) / len(d_list), 1)
+                            collector_call_stats[col_name]["أطول مكالمة ناجحة (ث)"] = round(max(d_list), 1)
+
+                # ── تجميع حسب المشرف ──
+                supervisor_call_stats: Dict[str, dict] = {}
+                for col_name, row_data in collector_call_stats.items():
+                    sup = row_data.get("المشرف", "غير محدد") or "غير محدد"
+                    if sup not in supervisor_call_stats:
+                        supervisor_call_stats[sup] = {
+                            "المشرف": sup, "إجمالي المكالمات": 0,
+                            "المكالمات الناجحة": 0, "المكالمات غير الناجحة": 0,
+                            "نسبة النجاح %": 0.0
+                        }
+                    supervisor_call_stats[sup]["إجمالي المكالمات"]      += row_data["إجمالي المكالمات"]
+                    supervisor_call_stats[sup]["المكالمات الناجحة"]     += row_data["المكالمات الناجحة"]
+                    supervisor_call_stats[sup]["المكالمات غير الناجحة"] += row_data["المكالمات غير الناجحة"]
+                for sup in supervisor_call_stats:
+                    t = supervisor_call_stats[sup]["إجمالي المكالمات"]
+                    s = supervisor_call_stats[sup]["المكالمات الناجحة"]
+                    supervisor_call_stats[sup]["نسبة النجاح %"] = round(s/t*100, 2) if t > 0 else 0.0
+
+                # ── بناء DataFrames ──
+                collector_calls_df = pd.DataFrame(list(collector_call_stats.values()))
+                top_caller = bottom_caller = None
+                if not collector_calls_df.empty:
+                    collector_calls_df = collector_calls_df.sort_values(
+                        "المكالمات الناجحة", ascending=False
+                    ).reset_index(drop=True)
+                    if call_dur_col and "متوسط مدة الناجحة (ث)" in collector_calls_df.columns:
+                        dur_sorted = collector_calls_df[collector_calls_df["متوسط مدة الناجحة (ث)"].notna()].copy()
+                        if not dur_sorted.empty:
+                            top_caller    = dur_sorted.nlargest(1, "متوسط مدة الناجحة (ث)").iloc[0]["المحصل"]
+                            bottom_caller = dur_sorted.nsmallest(1, "متوسط مدة الناجحة (ث)").iloc[0]["المحصل"]
+
+                supervisor_calls_df = pd.DataFrame(list(supervisor_call_stats.values()))
+                if not supervisor_calls_df.empty:
+                    supervisor_calls_df = supervisor_calls_df.sort_values(
+                        "المكالمات الناجحة", ascending=False
+                    ).reset_index(drop=True)
+
+                calls_analysis = {
+                    "total_calls":          total_calls,
+                    "total_successful":     total_successful,
+                    "total_failed":         total_failed,
+                    "success_rate":         success_rate,
+                    "threshold_seconds":    threshold,
+                    "avg_dur_all":          avg_dur_all,
+                    "avg_dur_success":      avg_dur_success,
+                    "top_caller_by_dur":    top_caller,
+                    "bottom_caller_by_dur": bottom_caller,
+                    "collector_calls_df":   collector_calls_df,
+                    "supervisor_calls_df":  supervisor_calls_df,
+                    "has_duration_col":     call_dur_col is not None,
+                    "has_status_col":       call_status_col is not None,
+                    "linked_to_portfolio":  call_debt_col is not None,
+                }
+                _log.info("📞 تحليل المكالمات: إجمالي=%d، ناجحة=%d، نسبة=%.1f%%",
+                          total_calls, total_successful, success_rate)
+
         return {
             "portfolio_with_vintage": export_portfolio,
+            "calls_analysis": calls_analysis,
+            "has_calls": has_calls,
             "portfolio_summary": portfolio_summary_df,
             "discounts_table": discounts_table_display,
             "teams_data": teams_data,
@@ -848,6 +1082,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
     وتصميم متناسق (Justified RTL Layout) مع رسومات بيانية واضحة ومبسطة، وجاهزية تامة للطباعة وتصدير PDF.
     """
     stats = results.get("stats", {})
+
     contact_df = results.get("contact_summary", pd.DataFrame())
     phone_df = results.get("phone_summary", pd.DataFrame())
     port_df = results.get("portfolio_summary", pd.DataFrame())
@@ -1048,6 +1283,54 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             """
     else:
         teams_html = '<div class="section-card"><p style="text-align:center; color:var(--text-muted);">لا توجد بيانات كافية لفرق العمل</p></div>'
+
+    has_calls_html = bool(results.get("has_calls"))
+    calls_data_html = results.get("calls_analysis", {}) if has_calls_html else {}
+    calls_tab_btn_html = '<button class="tab-btn" data-target="tab-calls" onclick="switchTab(\'tab-calls\')">📞 تحليل المكالمات</button>' if has_calls_html else ''
+    if has_calls_html:
+        _c_tot = calls_data_html.get("total_calls", 0)
+        _c_suc = calls_data_html.get("total_successful", 0)
+        _c_fail = calls_data_html.get("total_failed", 0)
+        _c_rate = calls_data_html.get("success_rate", 0.0)
+        _c_thresh = calls_data_html.get("threshold_seconds", 30)
+        _c_avg_all = calls_data_html.get("avg_dur_all")
+        _c_avg_suc = calls_data_html.get("avg_dur_success")
+        _c_top_dur = calls_data_html.get("top_caller_by_dur") or "-"
+        _c_bot_dur = calls_data_html.get("bottom_caller_by_dur") or "-"
+        _c_sup_df = calls_data_html.get("supervisor_calls_df", pd.DataFrame())
+        _c_col_df = calls_data_html.get("collector_calls_df", pd.DataFrame())
+        _dur_kpis_html = ""
+        if calls_data_html.get("has_duration_col"):
+            _dur_kpis_html = f"""
+            <div class="kpi-grid" style="margin-top:12px;">
+                <div class="kpi-card"><div class="kpi-label">متوسط مدة كل المكالمات</div><div class="kpi-value">{f'{_c_avg_all:.1f} ث' if _c_avg_all is not None else '-'}</div></div>
+                <div class="kpi-card"><div class="kpi-label">متوسط مدة الناجحة</div><div class="kpi-value">{f'{_c_avg_suc:.1f} ث' if _c_avg_suc is not None else '-'}</div></div>
+                <div class="kpi-card"><div class="kpi-label">أعلى محصل (متوسط المدة)</div><div class="kpi-value" style="font-size:1.1rem;">{_c_top_dur}</div></div>
+                <div class="kpi-card"><div class="kpi-label">أقل محصل (متوسط المدة)</div><div class="kpi-value" style="font-size:1.1rem;">{_c_bot_dur}</div></div>
+            </div>"""
+        calls_tab_pane_html = f"""
+        <!-- ==================== TAB 9: CALLS ANALYSIS ==================== -->
+        <div id="tab-calls" class="tab-pane">
+            <div class="section-card">
+                <div class="section-header">
+                    <div class="sec-title">📞 تحليل المكالمات الفعلية (الحد: &gt;{_c_thresh} ثانية)</div>
+                    <div class="sec-badge">شيت المكالمات</div>
+                </div>
+                <div class="kpi-grid">
+                    <div class="kpi-card"><div class="kpi-label">إجمالي المكالمات</div><div class="kpi-value">{_c_tot:,}</div></div>
+                    <div class="kpi-card"><div class="kpi-label">المكالمات الناجحة</div><div class="kpi-value">{_c_suc:,}</div></div>
+                    <div class="kpi-card"><div class="kpi-label">المكالمات غير الناجحة</div><div class="kpi-value">{_c_fail:,}</div></div>
+                    <div class="kpi-card"><div class="kpi-label">نسبة النجاح الكلية</div><div class="kpi-value">{_c_rate:.1f}%</div></div>
+                </div>
+                {_dur_kpis_html}
+                <h3 style="margin-top:22px; color:#1E3A8A;">👥 أداء المشرفين في المكالمات</h3>
+                <div style="margin-top:10px;">{df_to_html_table(_c_sup_df)}</div>
+                <h3 style="margin-top:22px; color:#1E3A8A;">🧑‍💼 أداء المحصلين في المكالمات</h3>
+                <div style="margin-top:10px;">{df_to_html_table(_c_col_df)}</div>
+            </div>
+        </div>"""
+    else:
+        calls_tab_pane_html = ""
 
     html = f"""<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -1404,6 +1687,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             <button class="tab-btn" data-target="tab-discounts" onclick="switchTab('tab-discounts')">🎯 عملاء الخصومات</button>
             <button class="tab-btn" data-target="tab-contact" onclick="switchTab('tab-contact')">📞 التواصل وجودة الأرقام</button>
             <button class="tab-btn" data-target="tab-status" onclick="switchTab('tab-status')">📑 التحصيل حسب الحالة</button>
+{calls_tab_btn_html}
             <button class="tab-btn btn-print" onclick="window.print()">🖨️ طباعة التقرير / PDF</button>
         </nav>
 
@@ -1600,6 +1884,8 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
                 </div>
             </div>
         </div>
+
+{calls_tab_pane_html}
 
         <!-- Footer -->
         <footer style="text-align:center; padding:24px; color:var(--text-muted); font-size:12.5px; border-top:1px solid var(--border); margin-top:20px;">
@@ -1869,6 +2155,18 @@ def export_analytics_excel_bytes(results: Dict[str, Any]) -> bytes:
         all_c = results.get("all_collectors")
         write_section_header("10. القائمة الكاملة لأداء المحصلين وتصنيف الربع (Quadrants)", len(all_c.columns) if all_c is not None and not all_c.empty else 18)
         write_dataframe(all_c)
+
+        # 11. تحليل المكالمات الفعلية (اختياري)
+        if results.get("has_calls"):
+            calls_d = results.get("calls_analysis", {})
+            sup_calls = calls_d.get("supervisor_calls_df")
+            if sup_calls is not None and not sup_calls.empty:
+                write_section_header("11. تحليل المكالمات الفعلية — المشرفين", len(sup_calls.columns))
+                write_dataframe(sup_calls)
+            col_calls = calls_d.get("collector_calls_df")
+            if col_calls is not None and not col_calls.empty:
+                write_section_header("12. تحليل المكالمات الفعلية — المحصلين", len(col_calls.columns))
+                write_dataframe(col_calls)
 
     output.seek(0)
     return output.getvalue()
