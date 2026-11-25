@@ -112,6 +112,19 @@ def to_clean_num(series: Any) -> pd.Series:
     ).fillna(0.0)
 
 
+def to_clean_num_scalar(val: Any) -> float:
+    """تحويل أي قيمة عددية فردية إلى float بأمان تام"""
+    if val is None or pd.isna(val):
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).replace(",", "").replace(" ", "").replace("﷼", "").strip()
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def extract_year_smart(val: Any) -> str:
     """استخراج سنة التعثر من صيغ التواريخ المختلفة أو أرقام إكسيل"""
     if val is None or pd.isna(val):
