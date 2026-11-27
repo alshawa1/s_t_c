@@ -17,6 +17,8 @@ modules/module14_portfolio_analytics.py
 
 from __future__ import annotations
 import io
+import gzip
+import base64
 import json
 import logging
 import re
@@ -178,6 +180,8 @@ class StrategicPortfolioModule:
         calls_closed_col: Optional[str] = None,
         calls_duration_col: Optional[str] = None,
         calls_success_threshold: int = 30,
+        followup_from: Optional[Any] = None,
+        followup_to: Optional[Any] = None,
         date_from: Optional[Any] = None,
         date_to: Optional[Any] = None,
         supervisors: Optional[List[str]] = None,
@@ -225,6 +229,28 @@ class StrategicPortfolioModule:
                 if df_p.empty:
                     raise ValueError("لا توجد سجلات مطابقة للمشرفين المحددين في ملف المحفظة!")
 
+
+        # ── 2.5 فلترة المحفظة حسب تاريخ المتابعة (اختياري - ينعكس على التحصيل والمكالمات) ──
+        has_followup_filter = False
+        followup_range_label = ""
+        col_fup_filter = _detect_col(df_p, _FOLLOWUP_DATE_COLS)
+        if (followup_from or followup_to) and col_fup_filter and col_fup_filter in df_p.columns:
+            from core.utils import normalize_date_series_to_iso, normalize_date_to_iso
+            norm_fups = normalize_date_series_to_iso(df_p[col_fup_filter].tolist())
+            fup_s = pd.Series(norm_fups, index=df_p.index)
+            mask_fup = fup_s != ""
+            f_from_iso = normalize_date_to_iso(followup_from) if followup_from else ""
+            f_to_iso   = normalize_date_to_iso(followup_to)   if followup_to   else ""
+            if f_from_iso:
+                mask_fup = mask_fup & (fup_s >= f_from_iso)
+            if f_to_iso:
+                mask_fup = mask_fup & (fup_s <= f_to_iso)
+            df_p = df_p[mask_fup].copy()
+            if len(df_p) == 0:
+                raise ValueError("لا توجد حسابات في المحفظة ضمن نطاق تاريخ المتابعة المحدد!")
+            has_followup_filter = True
+            followup_range_label = f"{f_from_iso or '...'} إلى {f_to_iso or '...'}"
+
         # ── 3. كاشف التغطية (من عمود تاريخ المتابعة) ──
         if col_followup and col_followup in df_p.columns:
             f_vals = df_p[col_followup].fillna("").astype(str).str.strip()
@@ -261,32 +287,25 @@ class StrategicPortfolioModule:
         else:
             df_p["_phone_status"] = "لا يوجد رقم مسجل"
 
-        # ── 6. استخراج سنة التعثر (من تاريخ فصل الخدمة / تاريخ إلغاء الخدمة حصراً) ──
-        # التحقق من وجود كولوم فصل الخدمة أو كولوم تاريخ آخر إلغاء في ملف المحفظة
+        # ── 6. استخراج سنة التعثر (تاريخ فصل الخدمة / إلغاء الخدمة / تاريخ إنتهاء الحساب) ──
         col_disc = _detect_col(df_p, ["تاريخ فصل الخدمة", "تاريخ فصل الخدمه"])
-        col_canc = _detect_col(df_p, ["تاريخ الغاء الخدمة", "تاريخ إلغاء الخدمة", "تاريخ اخر الغاء", "تاريخ آخر إلغاء", "تاريخ أخر الغاء"])
+        col_canc = _detect_col(df_p, [
+            "تاريخ الغاء الخدمة", "تاريخ إلغاء الخدمة", "تاريخ اخر الغاء", "تاريخ آخر إلغاء", "تاريخ أخر الغاء",
+            "تاريخ إنتهاء  الحساب", "تاريخ إنتهاء الحساب", "تاريخ انتهاء الحساب", "تاريخ الانتهاء", "تاريخ الإنتهاء"
+        ])
         col_vint_direct = _detect_col(df_p, ["سنة التعثر", "عمر الدين"])
 
-        if col_disc and col_disc in df_p.columns:
-            s_yr = df_p[col_disc].apply(extract_year_smart)
-            # دمج مع كولوم الإلغاء إذا كانت هناك قيم فارغة في كولوم الفصل
-            if col_canc and col_canc in df_p.columns:
-                s_canc_yr = df_p[col_canc].apply(extract_year_smart)
-                s_yr = s_yr.where(s_yr != "غير محدد", s_canc_yr)
-            df_p["سنة التعثر"] = s_yr
-            vintage_desc = f"{col_disc}" + (f" / {col_canc}" if col_canc else "")
-        elif col_canc and col_canc in df_p.columns:
-            df_p["سنة التعثر"] = df_p[col_canc].apply(extract_year_smart)
-            vintage_desc = col_canc
-        elif col_vint_direct and col_vint_direct in df_p.columns:
-            df_p["سنة التعثر"] = df_p[col_vint_direct].apply(extract_year_smart)
-            vintage_desc = col_vint_direct
-        elif col_cancel and col_cancel in df_p.columns:
-            df_p["سنة التعثر"] = df_p[col_cancel].apply(extract_year_smart)
-            vintage_desc = col_cancel
-        else:
-            df_p["سنة التعثر"] = "غير محدد"
-            vintage_desc = "غير متوفر"
+        # بناء عمود سنة التعثر بأولوية متدرجة صفاً بصف لمنع أي قيم فارغة (Blank)
+        vint_series = pd.Series("غير محدد", index=df_p.index)
+        used_vint_cols = []
+        for _vc in [col_disc, col_canc, col_cancel, col_vint_direct]:
+            if _vc and _vc in df_p.columns and _vc not in used_vint_cols:
+                used_vint_cols.append(_vc)
+                _extracted = df_p[_vc].apply(extract_year_smart)
+                vint_series = vint_series.where(vint_series != "غير محدد", _extracted)
+
+        df_p["سنة التعثر"] = vint_series
+        vintage_desc = " + ".join(used_vint_cols) if used_vint_cols else "غير متوفر"
 
         df_p["_main_status_clean"] = main_c.replace("", "غير محدد")
 
@@ -323,12 +342,24 @@ class StrategicPortfolioModule:
                     has_payments = True
                     df_pay["_amt"] = to_clean_num(df_pay[pay_amt_col])
 
-                    if pay_date_col:
-                        df_pay["_p_date"] = pd.to_datetime(df_pay[pay_date_col], errors="coerce")
-                        if date_from:
-                            df_pay = df_pay[df_pay["_p_date"] >= pd.Timestamp(date_from)]
-                        if date_to:
-                            df_pay = df_pay[df_pay["_p_date"] <= pd.Timestamp(date_to)]
+                    eff_pay_from = date_from or followup_from
+                    eff_pay_to   = date_to   or followup_to
+                    if pay_date_col and (eff_pay_from or eff_pay_to):
+                        from core.utils import normalize_date_series_to_iso, normalize_date_to_iso
+                        _p_dates_iso = pd.Series(
+                            normalize_date_series_to_iso(df_pay[pay_date_col].tolist()),
+                            index=df_pay.index
+                        )
+                        _p_mask = _p_dates_iso != ""
+                        if eff_pay_from:
+                            _pf_iso = normalize_date_to_iso(eff_pay_from)
+                            if _pf_iso:
+                                _p_mask = _p_mask & (_p_dates_iso >= _pf_iso)
+                        if eff_pay_to:
+                            _pt_iso = normalize_date_to_iso(eff_pay_to)
+                            if _pt_iso:
+                                _p_mask = _p_mask & (_p_dates_iso <= _pt_iso)
+                        df_pay = df_pay[_p_mask].copy()
 
                     p_debts = df_pay[pay_debt_col].apply(clean_id) if pay_debt_col else [""] * len(df_pay)
                     p_cids  = df_pay[pay_cid_col].apply(clean_id) if pay_cid_col else [""] * len(df_pay)
@@ -337,6 +368,9 @@ class StrategicPortfolioModule:
 
                     for amt, did, cid, direct_col in zip(p_amts, p_debts, p_cids, p_cols):
                         if amt <= 0.0:
+                            continue
+                        is_linked_to_port = (did in debt_to_col) or (cid in cid_to_col)
+                        if has_followup_filter and not is_linked_to_port:
                             continue
                         total_pay_amt += amt
                         if did:
@@ -703,7 +737,13 @@ class StrategicPortfolioModule:
         phone_valid_cnt = (df_p["_phone_status"] == "يوجد رقم رئيسي").sum()
         phone_valid_pct = round(phone_valid_cnt / total_records * 100, 1) if total_records > 0 else 0.0
 
-        export_portfolio = df_p.drop(
+        # تجهيز المحفظة الأساسية مضافاً إليها كافة أعمدة التحليل (التوصل، التغطية، التحصيل، المكالمات)
+        export_portfolio = df_p.copy()
+        export_portfolio["حالة التوصل (تحليل)"] = df_p["_contact_status"]
+        export_portfolio["حالة التغطية"] = df_p["_is_covered"].apply(lambda x: "مغطى" if x == 1 else "غير مغطى")
+        export_portfolio["توفر الرقم الرئيسي"] = df_p["_phone_status"]
+        export_portfolio["إجمالي التحصيل المربوط (﷼)"] = df_p["_collected_amt"].round(2)
+        export_portfolio = export_portfolio.drop(
             columns=["_debt_clean", "_cid_clean", "_debt_amt", "_remain_amt",
                      "_supervisor", "_collector", "_prio", "_contact_status", "_collected_amt",
                      "_is_covered", "_main_status_clean", "_phone_status"],
@@ -728,6 +768,7 @@ class StrategicPortfolioModule:
             "عدد المحصلين": int(df_p["_collector"].nunique()),
             "عدد المشرفين": int(df_p["_supervisor"].nunique()),
             "عدد سنوات عمر الدين": len(vintage_df),
+            **({"نطاق تاريخ المتابعة": followup_range_label} if has_followup_filter else {}),
             "عمود عمر الدين المستخدم": vintage_desc,
             "عدد المحافظ": len(port_df) if 'port_df' in locals() and not port_df.empty else 0,
             "أعلى محفظة مديونية": top_port_debt if 'top_port_debt' in locals() else "غير محدد",
@@ -907,6 +948,15 @@ class StrategicPortfolioModule:
                 c_agent_col = _detect_col(df_calls, _CALL_AGENT_COLS)
                 c_sup_col = _detect_col(df_calls, _CALL_SUP_COLS)
 
+                # تصفية شيت المكالمات ليشمل فقط مديونيات المحفظة المفلترة بتاريخ المتابعة
+                if has_followup_filter and c_debt_col:
+                    _allowed_debts = set(df_p["_debt_clean"].tolist())
+                    _c_debt_cleaned = df_calls[c_debt_col].apply(clean_id)
+                    df_calls = df_calls[_c_debt_cleaned.isin(_allowed_debts)].copy()
+                    if len(df_calls) == 0:
+                        has_calls = False
+
+            if has_calls and len(df_calls) > 0:
                 threshold = int(calls_success_threshold) if calls_success_threshold else 30
 
                 def _parse_dur_sec(val: Any) -> float:
@@ -1146,6 +1196,48 @@ class StrategicPortfolioModule:
                     "has_breakdown": any(x > 0 for x in [total_answered, total_no_answer, total_busy, total_closed]),
                     "linked_to_portfolio": c_debt_col is not None,
                 }
+                # إضافة أعمدة المكالمات إلى المحفظة المصدرة (ربط برقم المديونية)
+                if c_debt_col:
+                    debt_calls_map: Dict[str, dict] = {}
+                    for i_r in range(n_rows):
+                        did = raw_debts_c[i_r]
+                        if not did:
+                            continue
+                        if did not in debt_calls_map:
+                            debt_calls_map[did] = {
+                                "att": 0, "suc": 0, "fail": 0, "ans": 0,
+                                "noans": 0, "busy": 0, "closed": 0, "durs": []
+                            }
+                        dm = debt_calls_map[did]
+                        dm["att"] += int(round(att_series.iloc[i_r]))
+                        dm["suc"] += int(round(suc_series.iloc[i_r]))
+                        if fail_series is not None:
+                            dm["fail"] += int(round(fail_series.iloc[i_r]))
+                        else:
+                            dm["fail"] += max(0, int(round(att_series.iloc[i_r])) - int(round(suc_series.iloc[i_r])))
+                        dm["ans"] += int(round(ans_series.iloc[i_r]))
+                        dm["noans"] += int(round(noans_series.iloc[i_r]))
+                        dm["busy"] += int(round(busy_series.iloc[i_r]))
+                        dm["closed"] += int(round(closed_series.iloc[i_r]))
+                        dv = float(dur_vals.iloc[i_r])
+                        if c_dur_col and dv > 0:
+                            dm["durs"].append(dv)
+
+                    _d_keys = df_p["_debt_clean"].tolist()
+                    export_portfolio["إجمالي المحاولات (مكالمات)"] = [debt_calls_map[k]["att"] if k in debt_calls_map else 0 for k in _d_keys]
+                    export_portfolio["المكالمات الناجحة >30 ث"] = [debt_calls_map[k]["suc"] if k in debt_calls_map else 0 for k in _d_keys]
+                    export_portfolio["المكالمات الفاشلة (Failed)"] = [debt_calls_map[k]["fail"] if k in debt_calls_map else 0 for k in _d_keys]
+                    export_portfolio["إجمالي يرد (مكالمات)"] = [debt_calls_map[k]["ans"] if k in debt_calls_map else 0 for k in _d_keys]
+                    export_portfolio["لا يرد (مكالمات)"] = [debt_calls_map[k]["noans"] if k in debt_calls_map else 0 for k in _d_keys]
+                    export_portfolio["مشغول (مكالمات)"] = [debt_calls_map[k]["busy"] if k in debt_calls_map else 0 for k in _d_keys]
+                    export_portfolio["مغلق (مكالمات)"] = [debt_calls_map[k]["closed"] if k in debt_calls_map else 0 for k in _d_keys]
+                    if c_dur_col:
+                        export_portfolio["متوسط مدة المكالمة (ث)"] = [
+                            round(sum(debt_calls_map[k]["durs"]) / len(debt_calls_map[k]["durs"]), 1)
+                            if (k in debt_calls_map and debt_calls_map[k]["durs"]) else 0.0
+                            for k in _d_keys
+                        ]
+
                 _log.info("📞 تحليل المكالمات: محاولات=%d، ناجحة=%d، يرد=%d، لايرد=%d، مشغول=%d، مغلق=%d، متوسط=%.1fث",
                           total_attempts, total_successful, total_answered, total_no_answer, total_busy, total_closed, avg_dur_all or 0.0)
 
@@ -1177,6 +1269,12 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
     وتصميم متناسق (Justified RTL Layout) مع رسومات بيانية واضحة ومبسطة، وجاهزية تامة للطباعة وتصدير PDF.
     """
     stats = results.get("stats", {})
+    _port_enriched_df = results.get("portfolio_with_vintage")
+    if _port_enriched_df is not None and len(_port_enriched_df) > 0:
+        _csv_bytes = _port_enriched_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        _port_gz_b64 = base64.b64encode(gzip.compress(_csv_bytes, compresslevel=6)).decode("ascii")
+    else:
+        _port_gz_b64 = ""
 
     contact_df = results.get("contact_summary", pd.DataFrame())
     phone_df = results.get("phone_summary", pd.DataFrame())
@@ -1466,7 +1564,9 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             --shadow-lg: 0 10px 24px rgba(0,0,0,0.10);
         }}
         * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Cairo', 'Segoe UI', Tahoma, sans-serif; }}
-        body {{
+        html, body {{
+            max-width: 100%;
+            overflow-x: hidden;
             background: var(--bg);
             color: var(--text-body);
             direction: rtl;
@@ -1475,9 +1575,16 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             -webkit-font-smoothing: antialiased;
         }}
         .app-container {{
-            max-width: 1440px;
+            width: 100%;
+            max-width: 1280px;
             margin: 0 auto;
-            padding: 24px 30px;
+            padding: 16px 20px;
+            overflow-x: hidden;
+        }}
+        .section-card {{
+            width: 100%;
+            max-width: 100%;
+            overflow: hidden;
         }}
 
         /* Header */
@@ -1525,19 +1632,20 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
         /* Navigation Tabs */
         .tabs-nav {{
             position: sticky;
-            top: 10px;
+            top: 8px;
             z-index: 999;
             background: #ffffff;
             border: 1px solid var(--border);
-            border-radius: 14px;
-            padding: 8px 12px;
-            margin-bottom: 24px;
+            border-radius: 12px;
+            padding: 10px 12px;
+            margin-bottom: 20px;
             box-shadow: var(--shadow-md);
             display: flex;
+            flex-wrap: wrap;
+            justify-content: flex-start;
             align-items: center;
             gap: 8px;
-            overflow-x: auto;
-            white-space: nowrap;
+            width: 100%;
         }}
         .tab-btn {{
             background: transparent;
@@ -1565,13 +1673,14 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
         }}
         .btn-print {{
             margin-right: auto;
-            background: #f1f5f9;
-            color: var(--navy-dark);
-            border: 1px solid var(--border);
+            background: #99cc00;
+            color: #171717;
+            border: 1px solid #84cc16;
+            font-weight: 800;
         }}
         .btn-print:hover {{
-            background: #e2e8f0;
-            color: var(--navy-primary);
+            background: #84cc16;
+            color: #171717;
         }}
 
         /* Tab Panes */
@@ -1744,8 +1853,9 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
 
         .grid-2col {{
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: minmax(0, 1fr);
             gap: 20px;
+            width: 100%;
         }}
         @media (max-width: 900px) {{
             .grid-2col {{ grid-template-columns: 1fr; }}
@@ -1789,7 +1899,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             <button class="tab-btn" data-target="tab-contact" onclick="switchTab('tab-contact')">📞 التواصل وجودة الأرقام</button>
             <button class="tab-btn" data-target="tab-status" onclick="switchTab('tab-status')">📑 التحصيل حسب الحالة</button>
 {calls_tab_btn_html}
-            <button class="tab-btn btn-print" onclick="window.print()">🖨️ طباعة التقرير / PDF</button>
+            <button class="tab-btn btn-print" onclick="downloadEnrichedPortfolio()">📥 تنزيل المحفظة المحللة</button>
         </nav>
 
         <!-- ==================== TAB 1: OVERVIEW ==================== -->
@@ -2142,6 +2252,39 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             xaxis: {{ tickangle: -20 }},
             yaxis: {{ title: 'إجمالي التحصيل (ريال)' }}
         }}, {{ responsive: true }});
+
+        const PORT_GZ_B64 = "{_port_gz_b64}";
+        async function downloadEnrichedPortfolio() {{
+            if (!PORT_GZ_B64) {{
+                alert("لا توجد بيانات محفظة للتنزيل.");
+                return;
+            }}
+            try {{
+                const binStr = atob(PORT_GZ_B64);
+                const bytes = new Uint8Array(binStr.length);
+                for (let i = 0; i < binStr.length; i++) {{
+                    bytes[i] = binStr.charCodeAt(i);
+                }}
+                let outBlob;
+                if (typeof DecompressionStream !== "undefined") {{
+                    const ds = new DecompressionStream("gzip");
+                    const stream = new Blob([bytes]).stream().pipeThrough(ds);
+                    outBlob = await new Response(stream).blob();
+                }} else {{
+                    outBlob = new Blob([bytes], {{ type: "application/gzip" }});
+                }}
+                const url = URL.createObjectURL(outBlob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = "محفظة_stc_المحللة.csv";
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            }} catch (err) {{
+                alert("حدث خطأ أثناء تجهيز المحفظة: " + err);
+            }}
+        }}
     </script>
 </body>
 </html>"""
