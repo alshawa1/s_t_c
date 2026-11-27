@@ -112,6 +112,19 @@ def to_clean_num(series: Any) -> pd.Series:
     ).fillna(0.0)
 
 
+def to_clean_num_scalar(val: Any) -> float:
+    """تحويل أي قيمة عددية فردية إلى float بأمان تام"""
+    if val is None or pd.isna(val):
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).replace(",", "").replace(" ", "").replace("﷼", "").strip()
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
+
+
 def extract_year_smart(val: Any) -> str:
     """استخراج سنة التعثر من صيغ التواريخ المختلفة أو أرقام إكسيل"""
     if val is None or pd.isna(val):
@@ -154,6 +167,12 @@ class StrategicPortfolioModule:
         self,
         portfolio: Any,
         payments: Optional[Any] = None,
+        calls: Optional[Any] = None,
+        calls_debt_col: Optional[str] = None,
+        calls_attempts_col: Optional[str] = None,
+        calls_success_col: Optional[str] = None,
+        calls_duration_col: Optional[str] = None,
+        calls_success_threshold: int = 30,
         date_from: Optional[Any] = None,
         date_to: Optional[Any] = None,
         supervisors: Optional[List[str]] = None,
@@ -809,8 +828,312 @@ class StrategicPortfolioModule:
                     "all_members": sorted_team
                 }
 
+
+        # ── 16. تحليل المكالمات الفعلية (اختياري - مربوط برقم المديونية) ──
+        calls_analysis = {}
+        has_calls = False
+
+        if calls is not None:
+            if isinstance(calls, pl.DataFrame):
+                df_calls = calls.to_pandas()
+            elif isinstance(calls, pd.DataFrame):
+                df_calls = calls.copy()
+            else:
+                df_calls = pd.DataFrame(calls)
+
+            if len(df_calls) > 0:
+                has_calls = True
+                _CALL_DEBT_COLS = [
+                    "رقم المديونية", "رقم المديونيه", "رقم العقد", "رقم الحساب",
+                    "debt_id", "Debt ID", "AccountNo", "Account No"
+                ]
+                _CALL_ATTEMPTS_COLS = [
+                    "إجمالي المحاولات", "اجمالي المحاولات", "عدد المحاولات", "المحاولات",
+                    "total_attempts", "attempts", "Total Attempts"
+                ]
+                _CALL_SUCCESS_CNT_COLS = [
+                    "إجمالي المكالمات الناجحة أكبر من 30 ثانية", "اجمالي المكالمات الناجحة اكبر من 30 ثانيه",
+                    "إجمالي المكالمات الناجحة اكبر من 30 ثانية", "المكالمات الناجحة أكبر من 30 ثانية",
+                    "المكالمات الناجحة اكبر من 30 ثانيه", "المكالمات الناجحة > 30", "ناجحة أكبر من 30",
+                    "اكبر من 30 ثانيه", "أكبر من 30 ثانية", "المكالمات الناجحة", "مكالمات ناجحة",
+                    "successful_calls", "success_count"
+                ]
+                _CALL_ANSWERED_COLS = [
+                    "إجمالي يرد", "اجمالي يرد", "يرد", "تم الرد", "عدد يرد", "answered"
+                ]
+                _CALL_NO_ANS_COLS = [
+                    "لا يرد", "لايرد", "إجمالي لا يرد", "اجمالي لايرد", "إجمالي لايرد", "no_answer"
+                ]
+                _CALL_BUSY_COLS = [
+                    "مشغول", "إجمالي مشغول", "اجمالي مشغول", "busy"
+                ]
+                _CALL_CLOSED_COLS = [
+                    "مغلق", "إجمالي مغلق", "اجمالي مغلق", "closed", "switched_off"
+                ]
+                _CALL_DUR_COLS = [
+                    "مدة المكالمة بالثواني", "مده المكالمه بالثواني", "مدة المكالمة", "مده المكالمه",
+                    "المدة بالثواني", "المدة", "duration", "Duration", "call_duration", "seconds", "Seconds"
+                ]
+                _CALL_STATUS_COLS = [
+                    "حالة المكالمة", "الحالة", "status", "Status", "call_status", "نتيجة المكالمة"
+                ]
+                _CALL_AGENT_COLS = [
+                    "المحصل", "اسم المحصل", "الموظف", "المندوب", "agent", "collector", "Collector"
+                ]
+                _CALL_SUP_COLS = [
+                    "المشرف", "اسم المشرف", "supervisor", "Supervisor"
+                ]
+
+                c_debt_col = calls_debt_col if (calls_debt_col and calls_debt_col in df_calls.columns) else _detect_col(df_calls, _CALL_DEBT_COLS)
+                c_att_col = calls_attempts_col if (calls_attempts_col and calls_attempts_col in df_calls.columns) else _detect_col(df_calls, _CALL_ATTEMPTS_COLS)
+                c_suc_col = calls_success_col if (calls_success_col and calls_success_col in df_calls.columns) else _detect_col(df_calls, _CALL_SUCCESS_CNT_COLS)
+                c_ans_col = _detect_col(df_calls, _CALL_ANSWERED_COLS)
+                c_noans_col = _detect_col(df_calls, _CALL_NO_ANS_COLS)
+                c_busy_col = _detect_col(df_calls, _CALL_BUSY_COLS)
+                c_closed_col = _detect_col(df_calls, _CALL_CLOSED_COLS)
+                c_dur_col = calls_duration_col if (calls_duration_col and calls_duration_col in df_calls.columns) else _detect_col(df_calls, _CALL_DUR_COLS)
+                c_status_col = _detect_col(df_calls, _CALL_STATUS_COLS)
+                c_agent_col = _detect_col(df_calls, _CALL_AGENT_COLS)
+                c_sup_col = _detect_col(df_calls, _CALL_SUP_COLS)
+
+                threshold = int(calls_success_threshold) if calls_success_threshold else 30
+
+                def _parse_dur_sec(val: Any) -> float:
+                    if val is None or pd.isna(val):
+                        return 0.0
+                    if isinstance(val, (int, float)):
+                        return float(val)
+                    s = str(val).strip()
+                    m3 = re.match(r"^(\d+):(\d+):(\d+)$", s)
+                    if m3:
+                        return float(int(m3.group(1)) * 3600 + int(m3.group(2)) * 60 + int(m3.group(3)))
+                    m2 = re.match(r"^(\d+):(\d+)$", s)
+                    if m2:
+                        return float(int(m2.group(1)) * 60 + int(m2.group(2)))
+                    m1 = re.match(r"^[><]?=?\s*(\d+(?:\.\d+)?)", s)
+                    if m1:
+                        return float(m1.group(1))
+                    try:
+                        return float(re.sub(r"[^\d.]", "", s) or 0.0)
+                    except Exception:
+                        return 0.0
+
+                # تجهيز القيم العددية لكل صف
+                n_rows = len(df_calls)
+                dur_vals = df_calls[c_dur_col].apply(_parse_dur_sec).astype(float) if c_dur_col else pd.Series([0.0] * n_rows, index=df_calls.index)
+
+                # وضع الأعداد المجمعة لكل رقم مديونية (الشكل الأساسي الذي وصفه المستخدم)
+                is_aggregated_mode = any(col is not None for col in [c_att_col, c_suc_col, c_ans_col, c_noans_col, c_busy_col, c_closed_col])
+
+                if is_aggregated_mode:
+                    suc_series = to_clean_num(df_calls[c_suc_col]) if c_suc_col else pd.Series([0.0] * n_rows, index=df_calls.index)
+                    ans_series = to_clean_num(df_calls[c_ans_col]) if c_ans_col else pd.Series([0.0] * n_rows, index=df_calls.index)
+                    noans_series = to_clean_num(df_calls[c_noans_col]) if c_noans_col else pd.Series([0.0] * n_rows, index=df_calls.index)
+                    busy_series = to_clean_num(df_calls[c_busy_col]) if c_busy_col else pd.Series([0.0] * n_rows, index=df_calls.index)
+                    closed_series = to_clean_num(df_calls[c_closed_col]) if c_closed_col else pd.Series([0.0] * n_rows, index=df_calls.index)
+                    if c_att_col:
+                        att_series = to_clean_num(df_calls[c_att_col])
+                    else:
+                        att_series = ans_series + noans_series + busy_series + closed_series
+                        if att_series.sum() == 0 and suc_series.sum() > 0:
+                            att_series = suc_series.copy()
+                    # لو لم يوجد عمود ناجحة صريح، نحاول استنتاجه من مدة > 30
+                    if c_suc_col is None and c_dur_col is not None:
+                        raw_d_str = df_calls[c_dur_col].astype(str).str.strip()
+                        suc_series = (((dur_vals > threshold) | raw_d_str.str.startswith(">")) & ~raw_d_str.str.startswith("<")).astype(float)
+                else:
+                    # وضع السطر الواحد = مكالمة واحدة
+                    if c_dur_col:
+                        raw_d_str = df_calls[c_dur_col].astype(str).str.strip()
+                        suc_mask = ((dur_vals > threshold) | raw_d_str.str.startswith(">")) & ~raw_d_str.str.startswith("<")
+                    elif c_status_col:
+                        kws = ["ناجح", "ناجحة", "نجاح", "completed", "success", "answered", "connected", "مكتملة", "تم التوصل", "yes", "نعم"]
+                        st_low = df_calls[c_status_col].astype(str).str.lower().str.strip()
+                        suc_mask = pd.Series([False] * n_rows, index=df_calls.index)
+                        for kw in kws:
+                            suc_mask = suc_mask | st_low.str.contains(kw, na=False)
+                    else:
+                        suc_mask = pd.Series([True] * n_rows, index=df_calls.index)
+                    att_series = pd.Series([1.0] * n_rows, index=df_calls.index)
+                    suc_series = suc_mask.astype(float)
+                    ans_series = pd.Series([0.0] * n_rows, index=df_calls.index)
+                    noans_series = pd.Series([0.0] * n_rows, index=df_calls.index)
+                    busy_series = pd.Series([0.0] * n_rows, index=df_calls.index)
+                    closed_series = pd.Series([0.0] * n_rows, index=df_calls.index)
+
+                total_attempts = int(round(att_series.sum()))
+                total_successful = int(round(suc_series.sum()))
+                total_answered = int(round(ans_series.sum()))
+                total_no_answer = int(round(noans_series.sum()))
+                total_busy = int(round(busy_series.sum()))
+                total_closed = int(round(closed_series.sum()))
+                total_failed = max(0, total_attempts - total_successful)
+                success_rate = round(total_successful / total_attempts * 100, 2) if total_attempts > 0 else 0.0
+
+                valid_dur_mask = dur_vals > 0
+                avg_dur_all = round(float(dur_vals[valid_dur_mask].mean()), 1) if (c_dur_col and valid_dur_mask.any()) else (0.0 if c_dur_col else None)
+                succ_dur_mask = (suc_series > 0) & valid_dur_mask
+                avg_dur_success = round(float(dur_vals[succ_dur_mask].mean()), 1) if (c_dur_col and succ_dur_mask.any()) else avg_dur_all
+
+                # خرائط ربط سريع من المحفظة برقم المديونية
+                debt_to_sup: Dict[str, str] = {}
+                if "_supervisor" in df_p.columns:
+                    for did_p, sup_p in zip(df_p["_debt_clean"], df_p["_supervisor"]):
+                        if did_p and did_p not in debt_to_sup:
+                            debt_to_sup[did_p] = str(sup_p)
+
+                raw_debts_c = df_calls[c_debt_col].apply(clean_id).tolist() if c_debt_col else [""] * n_rows
+                raw_agents_c = df_calls[c_agent_col].astype(str).str.strip().tolist() if c_agent_col else [""] * n_rows
+                raw_sups_c = df_calls[c_sup_col].astype(str).str.strip().tolist() if c_sup_col else [""] * n_rows
+
+                collector_call_stats: Dict[str, dict] = {}
+                col_dur_lists: Dict[str, List[float]] = {}
+                sup_dur_lists: Dict[str, List[float]] = {}
+                linked_debts_count = 0
+
+                for i_r in range(n_rows):
+                    did = raw_debts_c[i_r]
+                    col_name = debt_to_col.get(did, "") if did else ""
+                    sup_name = debt_to_sup.get(did, "") if did else ""
+                    if did and col_name:
+                        linked_debts_count += 1
+                    if not col_name:
+                        ag = raw_agents_c[i_r]
+                        col_name = ag if ag and ag.lower() not in ("nan", "none", "null", "") else "غير مربوط بالمحفظة"
+                    if not sup_name:
+                        sp = raw_sups_c[i_r]
+                        sup_name = sp if sp and sp.lower() not in ("nan", "none", "null", "") else "غير محدد"
+
+                    if col_name not in collector_call_stats:
+                        collector_call_stats[col_name] = {
+                            "المحصل": col_name,
+                            "المشرف": sup_name,
+                            "عدد الحسابات": 0,
+                            "إجمالي المحاولات": 0,
+                            "المكالمات الناجحة": 0,
+                            "المكالمات غير الناجحة": 0,
+                            "نسبة النجاح %": 0.0,
+                            "إجمالي يرد": 0,
+                            "لا يرد": 0,
+                            "مشغول": 0,
+                            "مغلق": 0,
+                            "متوسط مدة المكالمة (ث)": None,
+                            "أطول مكالمة (ث)": None,
+                            "إجمالي التحصيل (﷼)": round(collector_collection.get(col_name, 0.0), 2),
+                        }
+                        col_dur_lists[col_name] = []
+
+                    st_row = collector_call_stats[col_name]
+                    st_row["عدد الحسابات"] += 1
+                    st_row["إجمالي المحاولات"] += int(round(att_series.iloc[i_r]))
+                    st_row["المكالمات الناجحة"] += int(round(suc_series.iloc[i_r]))
+                    st_row["إجمالي يرد"] += int(round(ans_series.iloc[i_r]))
+                    st_row["لا يرد"] += int(round(noans_series.iloc[i_r]))
+                    st_row["مشغول"] += int(round(busy_series.iloc[i_r]))
+                    st_row["مغلق"] += int(round(closed_series.iloc[i_r]))
+
+                    d_sec = float(dur_vals.iloc[i_r])
+                    if c_dur_col and d_sec > 0:
+                        col_dur_lists[col_name].append(d_sec)
+                        sup_dur_lists.setdefault(sup_name, []).append(d_sec)
+
+                # حساب النسب والمتوسطات لكل محصل
+                for col_name, st_row in collector_call_stats.items():
+                    t_att = st_row["إجمالي المحاولات"]
+                    s_cnt = st_row["المكالمات الناجحة"]
+                    st_row["المكالمات غير الناجحة"] = max(0, t_att - s_cnt)
+                    st_row["نسبة النجاح %"] = round(s_cnt / t_att * 100, 2) if t_att > 0 else 0.0
+                    d_list = col_dur_lists.get(col_name, [])
+                    if c_dur_col and d_list:
+                        st_row["متوسط مدة المكالمة (ث)"] = round(sum(d_list) / len(d_list), 1)
+                        st_row["أطول مكالمة (ث)"] = round(max(d_list), 1)
+
+                # تجميع حسب المشرف
+                supervisor_call_stats: Dict[str, dict] = {}
+                for col_name, st_row in collector_call_stats.items():
+                    sup = st_row.get("المشرف") or "غير محدد"
+                    if sup not in supervisor_call_stats:
+                        supervisor_call_stats[sup] = {
+                            "المشرف": sup,
+                            "عدد الحسابات": 0,
+                            "إجمالي المحاولات": 0,
+                            "المكالمات الناجحة": 0,
+                            "المكالمات غير الناجحة": 0,
+                            "نسبة النجاح %": 0.0,
+                            "إجمالي يرد": 0,
+                            "لا يرد": 0,
+                            "مشغول": 0,
+                            "مغلق": 0,
+                            "متوسط مدة المكالمة (ث)": None,
+                            "إجمالي التحصيل (﷼)": 0.0,
+                        }
+                    sp_row = supervisor_call_stats[sup]
+                    sp_row["عدد الحسابات"] += st_row["عدد الحسابات"]
+                    sp_row["إجمالي المحاولات"] += st_row["إجمالي المحاولات"]
+                    sp_row["المكالمات الناجحة"] += st_row["المكالمات الناجحة"]
+                    sp_row["المكالمات غير الناجحة"] += st_row["المكالمات غير الناجحة"]
+                    sp_row["إجمالي يرد"] += st_row["إجمالي يرد"]
+                    sp_row["لا يرد"] += st_row["لا يرد"]
+                    sp_row["مشغول"] += st_row["مشغول"]
+                    sp_row["مغلق"] += st_row["مغلق"]
+                    sp_row["إجمالي التحصيل (﷼)"] += st_row["إجمالي التحصيل (﷼)"]
+
+                for sup, sp_row in supervisor_call_stats.items():
+                    t_att = sp_row["إجمالي المحاولات"]
+                    s_cnt = sp_row["المكالمات الناجحة"]
+                    sp_row["نسبة النجاح %"] = round(s_cnt / t_att * 100, 2) if t_att > 0 else 0.0
+                    sp_row["إجمالي التحصيل (﷼)"] = round(sp_row["إجمالي التحصيل (﷼)"], 2)
+                    sd_list = sup_dur_lists.get(sup, [])
+                    if c_dur_col and sd_list:
+                        sp_row["متوسط مدة المكالمة (ث)"] = round(sum(sd_list) / len(sd_list), 1)
+
+                collector_calls_df = pd.DataFrame(list(collector_call_stats.values()))
+                top_caller = bottom_caller = None
+                if not collector_calls_df.empty:
+                    collector_calls_df = collector_calls_df.sort_values(
+                        "المكالمات الناجحة", ascending=False
+                    ).reset_index(drop=True)
+                    if c_dur_col and "متوسط مدة المكالمة (ث)" in collector_calls_df.columns:
+                        dur_sorted = collector_calls_df[collector_calls_df["متوسط مدة المكالمة (ث)"].notna()].copy()
+                        if not dur_sorted.empty:
+                            top_caller = dur_sorted.nlargest(1, "متوسط مدة المكالمة (ث)").iloc[0]["المحصل"]
+                            bottom_caller = dur_sorted.nsmallest(1, "متوسط مدة المكالمة (ث)").iloc[0]["المحصل"]
+
+                supervisor_calls_df = pd.DataFrame(list(supervisor_call_stats.values()))
+                if not supervisor_calls_df.empty:
+                    supervisor_calls_df = supervisor_calls_df.sort_values(
+                        "المكالمات الناجحة", ascending=False
+                    ).reset_index(drop=True)
+
+                calls_analysis = {
+                    "total_calls": total_attempts,
+                    "total_records": n_rows,
+                    "linked_debts_count": linked_debts_count,
+                    "total_successful": total_successful,
+                    "total_failed": total_failed,
+                    "total_answered": total_answered,
+                    "total_no_answer": total_no_answer,
+                    "total_busy": total_busy,
+                    "total_closed": total_closed,
+                    "success_rate": success_rate,
+                    "threshold_seconds": threshold,
+                    "avg_dur_all": avg_dur_all,
+                    "avg_dur_success": avg_dur_success,
+                    "top_caller_by_dur": top_caller,
+                    "bottom_caller_by_dur": bottom_caller,
+                    "collector_calls_df": collector_calls_df,
+                    "supervisor_calls_df": supervisor_calls_df,
+                    "has_duration_col": c_dur_col is not None,
+                    "has_breakdown": any(x > 0 for x in [total_answered, total_no_answer, total_busy, total_closed]),
+                    "linked_to_portfolio": c_debt_col is not None,
+                }
+                _log.info("📞 تحليل المكالمات: محاولات=%d، ناجحة=%d، يرد=%d، لايرد=%d، مشغول=%d، مغلق=%d، متوسط=%.1fث",
+                          total_attempts, total_successful, total_answered, total_no_answer, total_busy, total_closed, avg_dur_all or 0.0)
+
         return {
             "portfolio_with_vintage": export_portfolio,
+            "calls_analysis": calls_analysis,
+            "has_calls": has_calls,
             "portfolio_summary": portfolio_summary_df,
             "discounts_table": discounts_table_display,
             "teams_data": teams_data,
@@ -835,6 +1158,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
     وتصميم متناسق (Justified RTL Layout) مع رسومات بيانية واضحة ومبسطة، وجاهزية تامة للطباعة وتصدير PDF.
     """
     stats = results.get("stats", {})
+
     contact_df = results.get("contact_summary", pd.DataFrame())
     phone_df = results.get("phone_summary", pd.DataFrame())
     port_df = results.get("portfolio_summary", pd.DataFrame())
@@ -1036,38 +1360,91 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
     else:
         teams_html = '<div class="section-card"><p style="text-align:center; color:var(--text-muted);">لا توجد بيانات كافية لفرق العمل</p></div>'
 
+    has_calls_html = bool(results.get("has_calls"))
+    calls_data_html = results.get("calls_analysis", {}) if has_calls_html else {}
+    calls_tab_btn_html = '<button class="tab-btn" data-target="tab-calls" onclick="switchTab(\'tab-calls\')">📞 تحليل المكالمات الفعلية</button>' if has_calls_html else ''
+    if has_calls_html:
+        _c_tot = calls_data_html.get("total_calls", 0)
+        _c_suc = calls_data_html.get("total_successful", 0)
+        _c_rate = calls_data_html.get("success_rate", 0.0)
+        _c_ans = calls_data_html.get("total_answered", 0)
+        _c_noans = calls_data_html.get("total_no_answer", 0)
+        _c_busy = calls_data_html.get("total_busy", 0)
+        _c_closed = calls_data_html.get("total_closed", 0)
+        _c_thresh = calls_data_html.get("threshold_seconds", 30)
+        _c_avg_all = calls_data_html.get("avg_dur_all")
+        _c_top_dur = calls_data_html.get("top_caller_by_dur") or "-"
+        _c_bot_dur = calls_data_html.get("bottom_caller_by_dur") or "-"
+        _c_sup_df = calls_data_html.get("supervisor_calls_df", pd.DataFrame())
+        _c_col_df = calls_data_html.get("collector_calls_df", pd.DataFrame())
+        _dur_kpis_html = f"""
+            <div class="kpi-grid" style="margin-top:12px;">
+                <div class="kpi-card"><div class="kpi-label">إجمالي يرد</div><div class="kpi-value">{_c_ans:,}</div></div>
+                <div class="kpi-card"><div class="kpi-label">لا يرد</div><div class="kpi-value">{_c_noans:,}</div></div>
+                <div class="kpi-card"><div class="kpi-label">مشغول</div><div class="kpi-value">{_c_busy:,}</div></div>
+                <div class="kpi-card"><div class="kpi-label">مغلق</div><div class="kpi-value">{_c_closed:,}</div></div>
+            </div>
+            <div class="kpi-grid" style="margin-top:12px;">
+                <div class="kpi-card"><div class="kpi-label">متوسط مدة المكالمة</div><div class="kpi-value">{f'{_c_avg_all:.1f} ث' if _c_avg_all is not None else '-'}</div></div>
+                <div class="kpi-card"><div class="kpi-label">أعلى محصل (متوسط المدة)</div><div class="kpi-value" style="font-size:1.05rem;">{_c_top_dur}</div></div>
+                <div class="kpi-card"><div class="kpi-label">أقل محصل (متوسط المدة)</div><div class="kpi-value" style="font-size:1.05rem;">{_c_bot_dur}</div></div>
+            </div>"""
+        calls_tab_pane_html = f"""
+        <!-- ==================== TAB 9: CALLS ANALYSIS ==================== -->
+        <div id="tab-calls" class="tab-pane">
+            <div class="section-card">
+                <div class="section-header">
+                    <div class="sec-title">📞 تحليل المكالمات الفعلية (ناجحة &gt;{_c_thresh} ثانية)</div>
+                    <div class="sec-badge">مربوط برقم المديونية</div>
+                </div>
+                <div class="kpi-grid">
+                    <div class="kpi-card"><div class="kpi-label">إجمالي المحاولات</div><div class="kpi-value">{_c_tot:,}</div></div>
+                    <div class="kpi-card"><div class="kpi-label">المكالمات الناجحة (&gt;{_c_thresh} ث)</div><div class="kpi-value">{_c_suc:,}</div></div>
+                    <div class="kpi-card"><div class="kpi-label">نسبة النجاح %</div><div class="kpi-value">{_c_rate:.1f}%</div></div>
+                    <div class="kpi-card"><div class="kpi-label">متوسط المدة (ث)</div><div class="kpi-value">{f'{_c_avg_all:.1f} ث' if _c_avg_all is not None else '-'}</div></div>
+                </div>
+                {_dur_kpis_html}
+                <h3 style="margin-top:22px; color:#262626; border-bottom:2px solid #99cc00; padding-bottom:6px;">👥 أداء المشرفين في المكالمات</h3>
+                <div style="margin-top:10px;">{df_to_html_table(_c_sup_df)}</div>
+                <h3 style="margin-top:22px; color:#262626; border-bottom:2px solid #99cc00; padding-bottom:6px;">🧑‍💼 أداء المحصلين في المكالمات</h3>
+                <div style="margin-top:10px;">{df_to_html_table(_c_col_df)}</div>
+            </div>
+        </div>"""
+    else:
+        calls_tab_pane_html = ""
+
     html = f"""<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>تحليل شامل لشركة الاتصالات السعودية (STC) | شركة مهارة للتحصيل</title>
+    <title>تحليل شامل لمحفظه stc #1 | شركة مهارة للتحصيل</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
     <style>
         :root {{
-            --bg: #f8fafc;
+            --bg: #f4f5f7;
             --surface: #ffffff;
-            --border: #e2e8f0;
-            --border-light: #f1f5f9;
-            --navy-primary: #1e3a8a;
-            --navy-dark: #0f172a;
-            --blue-accent: #2563eb;
-            --blue-soft: #eff6ff;
-            --emerald: #10b981;
-            --emerald-soft: #ecfdf5;
-            --amber: #f59e0b;
-            --amber-soft: #fffbeb;
-            --rose: #ef4444;
-            --rose-soft: #fef2f2;
-            --text-dark: #0f172a;
-            --text-body: #334155;
-            --text-muted: #64748b;
-            --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
-            --shadow-md: 0 4px 14px rgba(0,0,0,0.05);
-            --shadow-lg: 0 10px 25px rgba(0,0,0,0.07);
+            --border: #e5e7eb;
+            --border-light: #f3f4f6;
+            --navy-primary: #262626;
+            --navy-dark: #171717;
+            --blue-accent: #99cc00;
+            --blue-soft: #f4fce3;
+            --emerald: #65a30d;
+            --emerald-soft: #ecfccb;
+            --amber: #4b5563;
+            --amber-soft: #f3f4f6;
+            --rose: #374151;
+            --rose-soft: #e5e7eb;
+            --text-dark: #171717;
+            --text-body: #374151;
+            --text-muted: #6b7280;
+            --shadow-sm: 0 1px 3px rgba(0,0,0,0.07);
+            --shadow-md: 0 4px 14px rgba(0,0,0,0.06);
+            --shadow-lg: 0 10px 24px rgba(0,0,0,0.10);
         }}
         * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: 'Cairo', 'Segoe UI', Tahoma, sans-serif; }}
         body {{
@@ -1086,9 +1463,10 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
 
         /* Header */
         .header-bar {{
-            background: linear-gradient(135deg, #1e3a8a 0%, #1e40af 50%, #0f172a 100%);
+            background: linear-gradient(135deg, #262626 0%, #333333 65%, #1a1a1a 100%);
+            border-bottom: 4px solid #99cc00;
             color: #ffffff;
-            border-radius: 16px;
+            border-radius: 12px;
             padding: 26px 32px;
             margin-bottom: 22px;
             box-shadow: var(--shadow-lg);
@@ -1106,7 +1484,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
         }}
         .header-title p {{
             font-size: 13px;
-            color: #bfdbfe;
+            color: #d9f99d;
         }}
         .header-meta {{
             text-align: left;
@@ -1115,8 +1493,8 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             gap: 6px;
         }}
         .badge-live {{
-            background: rgba(16, 185, 129, 0.2);
-            color: #6ee7b7;
+            background: rgba(153, 204, 0, 0.18);
+            color: #bef264;
             border: 1px solid rgba(16, 185, 129, 0.4);
             padding: 4px 12px;
             border-radius: 20px;
@@ -1372,7 +1750,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
         <!-- Top Header -->
         <header class="header-bar">
             <div class="header-title">
-                <h1>🏛️ تحليل شامل لشركة الاتصالات السعودية (STC) — اللوحة التنفيذية لتحليل المحفظة وعمر الدين</h1>
+                <h1>🏛️ تحليل شامل لمحفظه stc #1 — اللوحة التنفيذية لتحليل المحفظة وعمر الدين</h1>
                 <p>تحليل موحد وموثق يربط المحفظة بمدفوعات التحصيل برقم المديونية وحساب عدد العملاء بالهوية الفريدة</p>
             </div>
             <div class="header-meta">
@@ -1391,6 +1769,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             <button class="tab-btn" data-target="tab-discounts" onclick="switchTab('tab-discounts')">🎯 عملاء الخصومات</button>
             <button class="tab-btn" data-target="tab-contact" onclick="switchTab('tab-contact')">📞 التواصل وجودة الأرقام</button>
             <button class="tab-btn" data-target="tab-status" onclick="switchTab('tab-status')">📑 التحصيل حسب الحالة</button>
+{calls_tab_btn_html}
             <button class="tab-btn btn-print" onclick="window.print()">🖨️ طباعة التقرير / PDF</button>
         </nav>
 
@@ -1588,6 +1967,8 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             </div>
         </div>
 
+{calls_tab_pane_html}
+
         <!-- Footer -->
         <footer style="text-align:center; padding:24px; color:var(--text-muted); font-size:12.5px; border-top:1px solid var(--border); margin-top:20px;">
             نظام التحليل الاستراتيجي وعمر الدين © شركة مهارة للتحصيل | تم التوليد آلياً بدقة 100% | {now_str}
@@ -1626,7 +2007,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             values: {json.dumps(c_pie_values)},
             type: 'pie',
             hole: 0.55,
-            marker: {{ colors: ['#10b981', '#f59e0b', '#ef4444', '#64748b'] }},
+            marker: {{ colors: ['#84cc16', '#f59e0b', '#ef4444', '#64748b'] }},
             textinfo: 'percent+label',
             textposition: 'inside',
             hoverinfo: 'label+value+percent'
@@ -1641,7 +2022,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             y: {json.dumps(port_colls)},
             type: 'bar',
             name: 'إجمالي التحصيل',
-            marker: {{ color: '#10b981' }}
+            marker: {{ color: '#84cc16' }}
         }}], {{
             ...cleanLayout,
             xaxis: {{ tickangle: -15 }},
@@ -1654,7 +2035,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
                 y: {json.dumps(port_debts)},
                 type: 'bar',
                 name: 'مبلغ المديونية',
-                marker: {{ color: '#1e3a8a' }}
+                marker: {{ color: '#262626' }}
             }},
             {{
                 x: {json.dumps(port_names, ensure_ascii=False)},
@@ -1676,14 +2057,14 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
                 y: {json.dumps(v_debts)},
                 type: 'bar',
                 name: 'مبلغ المديونية',
-                marker: {{ color: '#1e3a8a' }}
+                marker: {{ color: '#262626' }}
             }},
             {{
                 x: {json.dumps(v_years, ensure_ascii=False)},
                 y: {json.dumps(v_colls)},
                 type: 'bar',
                 name: 'إجمالي التحصيل',
-                marker: {{ color: '#10b981' }}
+                marker: {{ color: '#84cc16' }}
             }}
         ], {{
             ...cleanLayout,
@@ -1697,7 +2078,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             y: {json.dumps(sup_df['إجمالي التحصيل'].tolist() if not sup_df.empty else [])},
             type: 'bar',
             name: 'تحصيل المشرف',
-            marker: {{ color: '#2563eb' }}
+            marker: {{ color: '#99cc00' }}
         }}], {{
             ...cleanLayout,
             xaxis: {{ tickangle: -15 }},
@@ -1709,7 +2090,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             y: {json.dumps(top_col_names, ensure_ascii=False)},
             type: 'bar',
             orientation: 'h',
-            marker: {{ color: '#10b981' }}
+            marker: {{ color: '#84cc16' }}
         }}], {{
             ...cleanLayout,
             margin: {{ l: 140, r: 20, t: 20, b: 30 }},
@@ -1721,7 +2102,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             values: {json.dumps(c_pie_values)},
             type: 'pie',
             hole: 0.5,
-            marker: {{ colors: ['#10b981', '#f59e0b', '#ef4444'] }}
+            marker: {{ colors: ['#84cc16', '#f59e0b', '#ef4444'] }}
         }}], {{ ...cleanLayout, margin: {{ l: 10, r: 10, t: 20, b: 20 }} }}, {{ responsive: true }});
 
         Plotly.newPlot('chart_phone_tab_pie', [{{
@@ -1729,7 +2110,7 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
             values: {json.dumps(p_pie_values)},
             type: 'pie',
             hole: 0.5,
-            marker: {{ colors: ['#10b981', '#ef4444'] }}
+            marker: {{ colors: ['#84cc16', '#ef4444'] }}
         }}], {{ ...cleanLayout, margin: {{ l: 10, r: 10, t: 20, b: 20 }} }}, {{ responsive: true }});
 
         Plotly.newPlot('chart_status_tab_bar', [{{
@@ -1856,6 +2237,18 @@ def export_analytics_excel_bytes(results: Dict[str, Any]) -> bytes:
         all_c = results.get("all_collectors")
         write_section_header("10. القائمة الكاملة لأداء المحصلين وتصنيف الربع (Quadrants)", len(all_c.columns) if all_c is not None and not all_c.empty else 18)
         write_dataframe(all_c)
+
+        # 11. تحليل المكالمات الفعلية (اختياري)
+        if results.get("has_calls"):
+            calls_d = results.get("calls_analysis", {})
+            sup_calls = calls_d.get("supervisor_calls_df")
+            if sup_calls is not None and not sup_calls.empty:
+                write_section_header("11. تحليل المكالمات الفعلية — المشرفين", len(sup_calls.columns))
+                write_dataframe(sup_calls)
+            col_calls = calls_d.get("collector_calls_df")
+            if col_calls is not None and not col_calls.empty:
+                write_section_header("12. تحليل المكالمات الفعلية — المحصلين", len(col_calls.columns))
+                write_dataframe(col_calls)
 
     output.seek(0)
     return output.getvalue()
