@@ -1320,31 +1320,53 @@ def run_afrad_app():
                     _calls_cols = list(_calls_scan_df.columns)
                     st.caption(f"📋 تم قراءة شيت المكالمات بنجاح: {len(_calls_scan_df):,} صف | {len(_calls_cols)} عمود")
 
-                    def _guess_col(kws):
-                        return next((c for c in _calls_cols if any(kw in c.lower() for kw in kws)), None)
+                    def _guess_col(kws, exclude_kws=None):
+                        for c in _calls_cols:
+                            cl = c.lower()
+                            if exclude_kws and any(ex in cl for ex in exclude_kws):
+                                continue
+                            if any(kw in cl for kw in kws):
+                                return c
+                        return None
 
-                    _g_debt = _guess_col(["مديونية", "مديونيه", "debt", "account", "عقد"])
-                    _g_att  = _guess_col(["محاولات", "attempt"])
-                    _g_suc  = _guess_col(["ناجح", "اكبر من 30", "أكبر من 30", ">30", "success"])
-                    _g_dur  = _guess_col(["مدة", "مده", "ثواني", "duration", "seconds"])
+                    _g_debt   = _guess_col(["مديونية", "مديونيه", "debt", "account", "عقد"])
+                    _g_att    = _guess_col(["محاولات", "attempt"])
+                    _g_suc    = _guess_col(["ناجح", "اكبر من 30", "أكبر من 30", ">30", "success"])
+                    _g_fail   = _guess_col(["failed", "فاشل", "فشل", "غير ناجح"])
+                    _g_dur    = _guess_col(["مدة", "مده", "ثوان", "duration", "seconds"])
+                    _g_ans    = _guess_col(["يرد", "answered"], exclude_kws=["لا يرد", "لايرد", "لا"])
+                    _g_noans  = _guess_col(["لا يرد", "لايرد", "no_answer", "no answer"])
+                    _g_busy   = _guess_col(["مشغول", "busy"])
+                    _g_closed = _guess_col(["مغلق", "closed", "switched"])
 
                     _opts_none = ["— كشف تلقائي —"] + _calls_cols
 
                     def _idx_for(g):
                         return _opts_none.index(g) if g and g in _opts_none else 0
 
-                    cc1, cc2 = st.columns(2)
+                    cc1, cc2, cc3 = st.columns(3)
                     with cc1:
-                        _sel_debt = st.selectbox("🔗 عمود رقم المديونية:", _opts_none, index=_idx_for(_g_debt), key="calls_debt_sel")
-                        _sel_suc  = st.selectbox("✅ عمود المكالمات الناجحة (>30 ث):", _opts_none, index=_idx_for(_g_suc), key="calls_suc_sel")
+                        _sel_debt   = st.selectbox("🔗 عمود رقم المديونية:", _opts_none, index=_idx_for(_g_debt), key="calls_debt_sel")
+                        _sel_fail   = st.selectbox("❌ عمود الفاشلة (Failed):", _opts_none, index=_idx_for(_g_fail), key="calls_fail_sel")
+                        _sel_noans  = st.selectbox("📵 عمود لا يرد:", _opts_none, index=_idx_for(_g_noans), key="calls_noans_sel")
                     with cc2:
-                        _sel_att  = st.selectbox("📊 عمود إجمالي المحاولات:", _opts_none, index=_idx_for(_g_att), key="calls_att_sel")
-                        _sel_dur  = st.selectbox("⏱️ عمود مدة المكالمة بالثواني:", _opts_none, index=_idx_for(_g_dur), key="calls_dur_col_select")
+                        _sel_att    = st.selectbox("📊 عمود إجمالي المحاولات:", _opts_none, index=_idx_for(_g_att), key="calls_att_sel")
+                        _sel_dur    = st.selectbox("⏱️ عمود مدة المكالمة بالثواني:", _opts_none, index=_idx_for(_g_dur), key="calls_dur_col_select")
+                        _sel_busy   = st.selectbox("⏳ عمود مشغول:", _opts_none, index=_idx_for(_g_busy), key="calls_busy_sel")
+                    with cc3:
+                        _sel_suc    = st.selectbox("✅ عمود المكالمات الناجحة (>30 ث):", _opts_none, index=_idx_for(_g_suc), key="calls_suc_sel")
+                        _sel_ans    = st.selectbox("📞 عمود إجمالي يرد:", _opts_none, index=_idx_for(_g_ans), key="calls_ans_sel")
+                        _sel_closed = st.selectbox("🔒 عمود مغلق:", _opts_none, index=_idx_for(_g_closed), key="calls_closed_sel")
 
-                    pa_params["calls_debt_col"]     = None if _sel_debt == "— كشف تلقائي —" else _sel_debt
-                    pa_params["calls_attempts_col"] = None if _sel_att  == "— كشف تلقائي —" else _sel_att
-                    pa_params["calls_success_col"]  = None if _sel_suc  == "— كشف تلقائي —" else _sel_suc
-                    pa_params["calls_duration_col"] = None if _sel_dur  == "— كشف تلقائي —" else _sel_dur
+                    pa_params["calls_debt_col"]      = None if _sel_debt   == "— كشف تلقائي —" else _sel_debt
+                    pa_params["calls_attempts_col"]  = None if _sel_att    == "— كشف تلقائي —" else _sel_att
+                    pa_params["calls_success_col"]   = None if _sel_suc    == "— كشف تلقائي —" else _sel_suc
+                    pa_params["calls_failed_col"]    = None if _sel_fail   == "— كشف تلقائي —" else _sel_fail
+                    pa_params["calls_duration_col"]  = None if _sel_dur    == "— كشف تلقائي —" else _sel_dur
+                    pa_params["calls_answered_col"]  = None if _sel_ans    == "— كشف تلقائي —" else _sel_ans
+                    pa_params["calls_no_answer_col"] = None if _sel_noans  == "— كشف تلقائي —" else _sel_noans
+                    pa_params["calls_busy_col"]      = None if _sel_busy   == "— كشف تلقائي —" else _sel_busy
+                    pa_params["calls_closed_col"]    = None if _sel_closed == "— كشف تلقائي —" else _sel_closed
                     pa_params["calls_success_threshold"] = 30
                 except Exception as _e_scan:
                     st.warning(f"⚠️ تعذّر قراءة أعمدة شيت المكالمات: {_e_scan}")
@@ -1569,6 +1591,11 @@ def run_afrad_app():
                             calls_debt_col=pa_params.get("calls_debt_col"),
                             calls_attempts_col=pa_params.get("calls_attempts_col"),
                             calls_success_col=pa_params.get("calls_success_col"),
+                            calls_failed_col=pa_params.get("calls_failed_col"),
+                            calls_answered_col=pa_params.get("calls_answered_col"),
+                            calls_no_answer_col=pa_params.get("calls_no_answer_col"),
+                            calls_busy_col=pa_params.get("calls_busy_col"),
+                            calls_closed_col=pa_params.get("calls_closed_col"),
                             calls_duration_col=pa_params.get("calls_duration_col"),
                             calls_success_threshold=pa_params.get("calls_success_threshold", 30),
                             date_from=pa_params.get("date_from"),
