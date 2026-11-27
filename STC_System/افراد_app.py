@@ -1727,12 +1727,13 @@ def run_afrad_app():
                     st.markdown("## 📞 تحليل المكالمات الفعلية (مربوط برقم المديونية)")
 
                     _thresh = calls_data.get('threshold_seconds', 30)
-                    kc1, kc2, kc3, kc4 = st.columns(4)
+                    kc1, kc2, kc3, kc4, kc5 = st.columns(5)
                     kc1.metric("إجمالي المحاولات", f"{calls_data.get('total_calls', 0):,}")
                     kc2.metric(f"المكالمات الناجحة (>{_thresh} ث)", f"{calls_data.get('total_successful', 0):,}")
-                    kc3.metric("نسبة النجاح الكلية", f"{calls_data.get('success_rate', 0):.1f}%")
+                    kc3.metric("المكالمات الفاشلة (Failed)", f"{calls_data.get('total_failed', 0):,}")
+                    kc4.metric("نسبة النجاح الكلية", f"{calls_data.get('success_rate', 0):.1f}%")
                     avg_all = calls_data.get("avg_dur_all")
-                    kc4.metric("⏱️ متوسط مدة المكالمة", f"{avg_all:.1f} ث" if avg_all is not None else "-")
+                    kc5.metric("⏱️ متوسط مدة المكالمة", f"{avg_all:.1f} ث" if avg_all is not None else "-")
 
                     kb1, kb2, kb3, kb4 = st.columns(4)
                     kb1.metric("إجمالي يرد", f"{calls_data.get('total_answered', 0):,}")
