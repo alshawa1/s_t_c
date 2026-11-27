@@ -1296,6 +1296,17 @@ def run_afrad_app():
         # ─── واجهة التحليل الشامل للمحفظة ───
         pa_params = {}
         if selected_key == "portfolio_analytics":
+            st.markdown("📅 **تحديد فترة تحليل المحفظة حسب تاريخ المتابعة (اختياري — ينعكس على التحصيل والمكالمات):**")
+            paf_c1, paf_c2 = st.columns(2)
+            with paf_c1:
+                pa_f_from = st.date_input("من تاريخ متابعة:", value=None, key="pa_fup_from")
+            with paf_c2:
+                pa_f_to = st.date_input("إلى تاريخ متابعة:", value=None, key="pa_fup_to")
+            if pa_f_from:
+                pa_params["followup_from"] = pa_f_from.strftime("%Y-%m-%d")
+            if pa_f_to:
+                pa_params["followup_to"] = pa_f_to.strftime("%Y-%m-%d")
+
             if uploaded_files.get("payments"):
                 st.markdown("⏱️ **تحديد فترة التحصيل (اختياري):**")
                 pa_c1, pa_c2 = st.columns(2)
@@ -1598,6 +1609,8 @@ def run_afrad_app():
                             calls_closed_col=pa_params.get("calls_closed_col"),
                             calls_duration_col=pa_params.get("calls_duration_col"),
                             calls_success_threshold=pa_params.get("calls_success_threshold", 30),
+                            followup_from=pa_params.get("followup_from"),
+                            followup_to=pa_params.get("followup_to"),
                             date_from=pa_params.get("date_from"),
                             date_to=pa_params.get("date_to"),
                             supervisors=pa_params.get("supervisors"),
@@ -2174,10 +2187,20 @@ def run_afrad_app():
                 if task_id == 14 and 'r' in locals():
                     from modules.module14_portfolio_analytics import export_analytics_html
                     html_content = export_analytics_html(r)
-                    col_dl1, col_dl2 = st.columns(2)
+                    import io as _io_port
+                    _port_dl_df = r.get("portfolio_with_vintage")
+                    _port_xlsx_bytes = b""
+                    if _port_dl_df is not None and len(_port_dl_df) > 0:
+                        _p_buf = _io_port.BytesIO()
+                        with pd.ExcelWriter(_p_buf, engine="xlsxwriter", engine_kwargs={"options": {"nan_inf_to_errors": True}}) as _pw:
+                            _port_dl_df.to_excel(_pw, index=False, sheet_name="المحفظة المحللة")
+                            _pw.book.worksheets()[0].right_to_left()
+                        _port_xlsx_bytes = _p_buf.getvalue()
+
+                    col_dl1, col_dl2, col_dl3 = st.columns(3)
                     with col_dl1:
                         st.download_button(
-                            label="📥 تحميل التقرير المنسق (Excel Styled)",
+                            label="📥 تحميل التقرير المنسق (Excel)",
                             data=excel_bytes,
                             file_name=download_name,
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2185,10 +2208,19 @@ def run_afrad_app():
                         )
                     with col_dl2:
                         st.download_button(
-                            label="🌐 تحميل الداشبورد التفاعلي كملف HTML مستقل (Web Dashboard)",
+                            label="🌐 تحميل الداشبورد HTML",
                             data=html_content.encode("utf-8"),
                             file_name=f"داشبورد_المحفظة_الاستراتيجي_{ts_str}.html",
                             mime="text/html",
+                            use_container_width=True
+                        )
+                    with col_dl3:
+                        st.download_button(
+                            label="📊 تنزيل المحفظة المحللة (Excel)",
+                            data=_port_xlsx_bytes,
+                            file_name=f"محفظة_stc_المحللة_{ts_str}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            disabled=(len(_port_xlsx_bytes) == 0),
                             use_container_width=True
                         )
                 else:
