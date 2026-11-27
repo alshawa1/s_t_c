@@ -1313,57 +1313,41 @@ def run_afrad_app():
             # ─── معطيات شيت المكالمات (اختياري) ───
             if uploaded_files.get("calls"):
                 st.markdown("---")
-                st.markdown("📞 **إعدادات شيت المكالمات الناجحة:**")
+                st.markdown("📞 **إعدادات شيت المكالمات الفعلية (مربوط برقم المديونية):**")
                 _calls_tmp = _get_stable_tmp_path(uploaded_files["calls"], "calls")
                 try:
-                    _calls_scan_df = pl.read_excel(_calls_tmp, engine="calamine")
+                    _calls_scan_df = read_excel_calamine(_calls_tmp)
                     _calls_cols = list(_calls_scan_df.columns)
-                    st.caption(f"📋 الأعمدة المكتشفة في شيت المكالمات: {len(_calls_cols)} عمود")
+                    st.caption(f"📋 تم قراءة شيت المكالمات بنجاح: {len(_calls_scan_df):,} صف | {len(_calls_cols)} عمود")
 
-                    # اختيار عمود المدة
-                    _dur_col_guess = next(
-                        (c for c in _calls_cols if any(kw in c.lower() for kw in
-                         ["مدة", "duration", "seconds", "ثانية", "وقت", "time", "الوقت", "المدة"])),
-                        None
-                    )
-                    _dur_options = ["— لا يوجد عمود مدة —"] + _calls_cols
-                    _dur_default_idx = (_dur_options.index(_dur_col_guess)
-                                        if _dur_col_guess and _dur_col_guess in _dur_options else 0)
-                    calls_c1, calls_c2 = st.columns([2, 1])
-                    with calls_c1:
-                        _selected_dur_col = st.selectbox(
-                            "🕐 اختر عمود مدة المكالمة (بالثواني):",
-                            options=_dur_options,
-                            index=_dur_default_idx,
-                            key="calls_dur_col_select",
-                            help="اختر العمود الذي يحتوي على مدة المكالمة بالثواني. المكالمات التي مدتها > 30 ثانية تعتبر ناجحة."
-                        )
-                    with calls_c2:
-                        _calls_threshold = st.number_input(
-                            "⏱️ حد المكالمة الناجحة (ثانية):",
-                            min_value=1,
-                            max_value=300,
-                            value=30,
-                            step=5,
-                            key="calls_threshold",
-                            help="المكالمات التي مدتها أكبر من هذه القيمة تعتبر ناجحة"
-                        )
+                    def _guess_col(kws):
+                        return next((c for c in _calls_cols if any(kw in c.lower() for kw in kws)), None)
 
-                    if _selected_dur_col and _selected_dur_col != "— لا يوجد عمود مدة —":
-                        pa_params["calls_duration_col"] = _selected_dur_col
-                        # preview sample values
-                        _sample_vals = _calls_scan_df[_selected_dur_col].drop_nulls().head(5).to_list()
-                        st.info(f"✅ عمود المدة المختار: **{_selected_dur_col}** | أمثلة: {_sample_vals}")
-                    else:
-                        pa_params["calls_duration_col"] = None
-                        st.info("ℹ️ لم يُختر عمود مدة — سيتم اعتبار جميع المكالمات ناجحة أو استخدام عمود الحالة إن وُجد.")
+                    _g_debt = _guess_col(["مديونية", "مديونيه", "debt", "account", "عقد"])
+                    _g_att  = _guess_col(["محاولات", "attempt"])
+                    _g_suc  = _guess_col(["ناجح", "اكبر من 30", "أكبر من 30", ">30", "success"])
+                    _g_dur  = _guess_col(["مدة", "مده", "ثواني", "duration", "seconds"])
 
-                    pa_params["calls_success_threshold"] = int(_calls_threshold)
+                    _opts_none = ["— كشف تلقائي —"] + _calls_cols
 
+                    def _idx_for(g):
+                        return _opts_none.index(g) if g and g in _opts_none else 0
+
+                    cc1, cc2 = st.columns(2)
+                    with cc1:
+                        _sel_debt = st.selectbox("🔗 عمود رقم المديونية:", _opts_none, index=_idx_for(_g_debt), key="calls_debt_sel")
+                        _sel_suc  = st.selectbox("✅ عمود المكالمات الناجحة (>30 ث):", _opts_none, index=_idx_for(_g_suc), key="calls_suc_sel")
+                    with cc2:
+                        _sel_att  = st.selectbox("📊 عمود إجمالي المحاولات:", _opts_none, index=_idx_for(_g_att), key="calls_att_sel")
+                        _sel_dur  = st.selectbox("⏱️ عمود مدة المكالمة بالثواني:", _opts_none, index=_idx_for(_g_dur), key="calls_dur_col_select")
+
+                    pa_params["calls_debt_col"]     = None if _sel_debt == "— كشف تلقائي —" else _sel_debt
+                    pa_params["calls_attempts_col"] = None if _sel_att  == "— كشف تلقائي —" else _sel_att
+                    pa_params["calls_success_col"]  = None if _sel_suc  == "— كشف تلقائي —" else _sel_suc
+                    pa_params["calls_duration_col"] = None if _sel_dur  == "— كشف تلقائي —" else _sel_dur
+                    pa_params["calls_success_threshold"] = 30
                 except Exception as _e_scan:
                     st.warning(f"⚠️ تعذّر قراءة أعمدة شيت المكالمات: {_e_scan}")
-                    pa_params["calls_duration_col"] = None
-                    pa_params["calls_success_threshold"] = 30
 
         # ─── التحقق من الجاهزية ───
         ready_to_run = True
@@ -1411,6 +1395,16 @@ def run_afrad_app():
 
                     portfolio = dfs.get(MAIN_PORTFOLIO)
                     promise = dfs.get(PROMISE_PAY, pl.DataFrame())
+
+                    # قراءة شيت المكالمات مباشرة (اختياري) بدون قيود Schema
+                    if uploaded_files.get("calls"):
+                        try:
+                            _c_file = uploaded_files["calls"]
+                            _c_tmp_path = _get_stable_tmp_path(_c_file, "calls")
+                            dfs["calls"] = read_excel_calamine(_c_tmp_path)
+                        except Exception as _ce:
+                            st.warning(f"⚠️ تعذّر قراءة ملف المكالمات: {_ce}")
+                            dfs["calls"] = None
 
                 with st.spinner("⚙️ جاري معالجة البيانات وتطبيق القواعد الحسابية..."):
                     task_id = module_info["id"]
@@ -1572,6 +1566,9 @@ def run_afrad_app():
                             portfolio=portfolio,
                             payments=dfs.get("payments"),
                             calls=dfs.get("calls"),
+                            calls_debt_col=pa_params.get("calls_debt_col"),
+                            calls_attempts_col=pa_params.get("calls_attempts_col"),
+                            calls_success_col=pa_params.get("calls_success_col"),
                             calls_duration_col=pa_params.get("calls_duration_col"),
                             calls_success_threshold=pa_params.get("calls_success_threshold", 30),
                             date_from=pa_params.get("date_from"),
@@ -1727,72 +1724,88 @@ def run_afrad_app():
                     import plotly.express as px
                     calls_data = r.get("calls_analysis", {})
                     st.markdown("---")
-                    st.markdown("## 📞 تحليل المكالمات الفعلية")
+                    st.markdown("## 📞 تحليل المكالمات الفعلية (مربوط برقم المديونية)")
 
-                    # KPIs
                     _thresh = calls_data.get('threshold_seconds', 30)
                     kc1, kc2, kc3, kc4 = st.columns(4)
-                    kc1.metric("إجمالي المكالمات", f"{calls_data.get('total_calls', 0):,}")
+                    kc1.metric("إجمالي المحاولات", f"{calls_data.get('total_calls', 0):,}")
                     kc2.metric(f"المكالمات الناجحة (>{_thresh} ث)", f"{calls_data.get('total_successful', 0):,}")
-                    kc3.metric("المكالمات غير الناجحة", f"{calls_data.get('total_failed', 0):,}")
-                    kc4.metric("نسبة النجاح الكلية", f"{calls_data.get('success_rate', 0):.1f}%")
+                    kc3.metric("نسبة النجاح الكلية", f"{calls_data.get('success_rate', 0):.1f}%")
+                    avg_all = calls_data.get("avg_dur_all")
+                    kc4.metric("⏱️ متوسط مدة المكالمة", f"{avg_all:.1f} ث" if avg_all is not None else "-")
+
+                    kb1, kb2, kb3, kb4 = st.columns(4)
+                    kb1.metric("إجمالي يرد", f"{calls_data.get('total_answered', 0):,}")
+                    kb2.metric("لا يرد", f"{calls_data.get('total_no_answer', 0):,}")
+                    kb3.metric("مشغول", f"{calls_data.get('total_busy', 0):,}")
+                    kb4.metric("مغلق", f"{calls_data.get('total_closed', 0):,}")
 
                     if calls_data.get("has_duration_col"):
-                        kd1, kd2, kd3, kd4 = st.columns(4)
-                        avg_all = calls_data.get("avg_dur_all")
-                        avg_suc = calls_data.get("avg_dur_success")
-                        top_dur = calls_data.get("top_caller_by_dur") or "-"
-                        bot_dur = calls_data.get("bottom_caller_by_dur") or "-"
-                        kd1.metric("⏱️ متوسط مدة كل المكالمات", f"{avg_all:.1f} ث" if avg_all is not None else "-")
-                        kd2.metric("⏱️ متوسط مدة الناجحة", f"{avg_suc:.1f} ث" if avg_suc is not None else "-")
-                        kd3.metric("🏆 أعلى محصل (متوسط المدة)", str(top_dur))
-                        kd4.metric("📉 أقل محصل (متوسط المدة)", str(bot_dur))
+                        kd1, kd2, kd3 = st.columns(3)
+                        kd1.metric("🏆 أعلى محصل (متوسط المدة)", str(calls_data.get("top_caller_by_dur") or "-"))
+                        kd2.metric("📉 أقل محصل (متوسط المدة)", str(calls_data.get("bottom_caller_by_dur") or "-"))
+                        kd3.metric("🔗 حسابات مربوطة بالمحفظة", f"{calls_data.get('linked_debts_count', 0):,}")
+
+                    # رسم بياني لتوزيع حالات المكالمات بالألوان التنفيذية (#262626 / #99CC00 / #9CA3AF)
+                    if calls_data.get("has_breakdown"):
+                        bd_df = pd.DataFrame([
+                            {"الحالة": "إجمالي يرد", "العدد": calls_data.get("total_answered", 0)},
+                            {"الحالة": "لا يرد", "العدد": calls_data.get("total_no_answer", 0)},
+                            {"الحالة": "مشغول", "العدد": calls_data.get("total_busy", 0)},
+                            {"الحالة": "مغلق", "العدد": calls_data.get("total_closed", 0)},
+                        ])
+                        bd_df = bd_df[bd_df["العدد"] > 0]
+                        if not bd_df.empty:
+                            fig_bd = px.pie(
+                                bd_df, names="الحالة", values="العدد", hole=0.45,
+                                title="📊 توزيع محاولات الاتصال (يرد / لا يرد / مشغول / مغلق)",
+                                color="الحالة",
+                                color_discrete_map={
+                                    "إجمالي يرد": "#99CC00",
+                                    "لا يرد": "#262626",
+                                    "مشغول": "#9CA3AF",
+                                    "مغلق": "#D1D5DB",
+                                }
+                            )
+                            fig_bd.update_layout(height=320, margin=dict(l=10, r=10, t=40, b=10))
+                            st.plotly_chart(fig_bd, use_container_width=True)
 
                     ct1, ct2 = st.columns(2)
                     with ct1:
-                        st.markdown("#### 👥 أداء المشرفين في المكالمات")
+                        st.markdown("#### 👥 أداء المشرفين في المكالمات ومتوسط المدة")
                         sup_calls_df = calls_data.get("supervisor_calls_df")
                         if sup_calls_df is not None and not sup_calls_df.empty:
                             st.dataframe(sup_calls_df, use_container_width=True, hide_index=True)
-                            # رسم بياني للمشرفين
-                            if len(sup_calls_df) > 0:
-                                fig_sup_calls = px.bar(
-                                    sup_calls_df,
-                                    x="المشرف",
-                                    y=["المكالمات الناجحة", "المكالمات غير الناجحة"],
-                                    title="📊 المكالمات الناجحة وغير الناجحة حسب المشرف",
-                                    barmode="stack",
-                                    color_discrete_map={"المكالمات الناجحة": "#1E3A8A", "المكالمات غير الناجحة": "#93C5FD"}
-                                )
-                                fig_sup_calls.update_layout(height=350, margin=dict(l=10, r=10, t=40, b=10))
-                                st.plotly_chart(fig_sup_calls, use_container_width=True)
-                        else:
-                            st.info("لا توجد بيانات مشرفين في شيت المكالمات")
+                            fig_sup_calls = px.bar(
+                                sup_calls_df,
+                                x="المشرف",
+                                y=["المكالمات الناجحة", "المكالمات غير الناجحة"],
+                                title="📊 المكالمات الناجحة مقابل غير الناجحة حسب المشرف",
+                                barmode="stack",
+                                color_discrete_map={"المكالمات الناجحة": "#99CC00", "المكالمات غير الناجحة": "#262626"}
+                            )
+                            fig_sup_calls.update_layout(height=350, margin=dict(l=10, r=10, t=40, b=10))
+                            st.plotly_chart(fig_sup_calls, use_container_width=True)
 
                     with ct2:
-                        st.markdown("#### 🧑‍💼 أداء المحصلين في المكالمات")
+                        st.markdown("#### 🧑‍💼 أداء المحصلين في المكالمات ومتوسط المدة")
                         col_calls_df = calls_data.get("collector_calls_df")
                         if col_calls_df is not None and not col_calls_df.empty:
-                            # أفضل 10 محصلين
                             top_calls = col_calls_df.head(10)
                             st.dataframe(top_calls, use_container_width=True, hide_index=True)
-                            if len(top_calls) > 0:
-                                fig_col_calls = px.bar(
-                                    top_calls,
-                                    x="المحصل",
-                                    y="المكالمات الناجحة",
-                                    title="🏆 أفضل 10 محصلين في المكالمات الناجحة",
-                                    color="نسبة النجاح %",
-                                    color_continuous_scale=["#93C5FD", "#1E3A8A"]
-                                )
-                                fig_col_calls.update_layout(height=350, margin=dict(l=10, r=10, t=40, b=10))
-                                st.plotly_chart(fig_col_calls, use_container_width=True)
-                        else:
-                            st.info("لا توجد بيانات محصلين في شيت المكالمات")
+                            fig_col_calls = px.bar(
+                                top_calls,
+                                x="المحصل",
+                                y="المكالمات الناجحة",
+                                title="🏆 أفضل 10 محصلين في المكالمات الناجحة",
+                                color="نسبة النجاح %",
+                                color_continuous_scale=["#D1D5DB", "#99CC00", "#262626"]
+                            )
+                            fig_col_calls.update_layout(height=350, margin=dict(l=10, r=10, t=40, b=10))
+                            st.plotly_chart(fig_col_calls, use_container_width=True)
 
-                    # جدول كامل للمحصلين
                     if calls_data.get("collector_calls_df") is not None and not calls_data["collector_calls_df"].empty:
-                        with st.expander("📋 جدول كامل للمحصلين والمكالمات"):
+                        with st.expander("📋 جدول كامل للمحصلين (المحاولات، الناجحة، يرد/لا يرد/مشغول/مغلق، ومتوسط المدة)"):
                             st.dataframe(calls_data["collector_calls_df"], use_container_width=True, hide_index=True)
 
                 # التحليل الشامل للمحفظة وعمر الدين (Module 14)
