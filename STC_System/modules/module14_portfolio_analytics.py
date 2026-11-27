@@ -171,6 +171,11 @@ class StrategicPortfolioModule:
         calls_debt_col: Optional[str] = None,
         calls_attempts_col: Optional[str] = None,
         calls_success_col: Optional[str] = None,
+        calls_failed_col: Optional[str] = None,
+        calls_answered_col: Optional[str] = None,
+        calls_no_answer_col: Optional[str] = None,
+        calls_busy_col: Optional[str] = None,
+        calls_closed_col: Optional[str] = None,
         calls_duration_col: Optional[str] = None,
         calls_success_threshold: int = 30,
         date_from: Optional[Any] = None,
@@ -875,8 +880,9 @@ class StrategicPortfolioModule:
                     "فشل", "إجمالي فاشلة", "اجمالي فاشلة", "غير ناجحة", "المكالمات غير الناجحة"
                 ]
                 _CALL_DUR_COLS = [
-                    "مدة المكالمة بالثواني", "مده المكالمه بالثواني", "مدة المكالمة", "مده المكالمه",
-                    "المدة بالثواني", "المدة", "duration", "Duration", "call_duration", "seconds", "Seconds"
+                    "مدة المكالمة بالثواني", "مده المكالمه بالثواني", "مده ثوانى المكالمه", "مدة ثواني المكالمة",
+                    "مدة المكالمة", "مده المكالمه", "المدة بالثواني", "المدة",
+                    "duration", "Duration", "call_duration", "seconds", "Seconds"
                 ]
                 _CALL_STATUS_COLS = [
                     "حالة المكالمة", "الحالة", "status", "Status", "call_status", "نتيجة المكالمة"
@@ -891,11 +897,11 @@ class StrategicPortfolioModule:
                 c_debt_col = calls_debt_col if (calls_debt_col and calls_debt_col in df_calls.columns) else _detect_col(df_calls, _CALL_DEBT_COLS)
                 c_att_col = calls_attempts_col if (calls_attempts_col and calls_attempts_col in df_calls.columns) else _detect_col(df_calls, _CALL_ATTEMPTS_COLS)
                 c_suc_col = calls_success_col if (calls_success_col and calls_success_col in df_calls.columns) else _detect_col(df_calls, _CALL_SUCCESS_CNT_COLS)
-                c_ans_col = _detect_col(df_calls, _CALL_ANSWERED_COLS)
-                c_noans_col = _detect_col(df_calls, _CALL_NO_ANS_COLS)
-                c_busy_col = _detect_col(df_calls, _CALL_BUSY_COLS)
-                c_closed_col = _detect_col(df_calls, _CALL_CLOSED_COLS)
-                c_fail_col = _detect_col(df_calls, _CALL_FAILED_COLS)
+                c_ans_col = calls_answered_col if (calls_answered_col and calls_answered_col in df_calls.columns) else _detect_col(df_calls, _CALL_ANSWERED_COLS)
+                c_noans_col = calls_no_answer_col if (calls_no_answer_col and calls_no_answer_col in df_calls.columns) else _detect_col(df_calls, _CALL_NO_ANS_COLS)
+                c_busy_col = calls_busy_col if (calls_busy_col and calls_busy_col in df_calls.columns) else _detect_col(df_calls, _CALL_BUSY_COLS)
+                c_closed_col = calls_closed_col if (calls_closed_col and calls_closed_col in df_calls.columns) else _detect_col(df_calls, _CALL_CLOSED_COLS)
+                c_fail_col = calls_failed_col if (calls_failed_col and calls_failed_col in df_calls.columns) else _detect_col(df_calls, _CALL_FAILED_COLS)
                 c_dur_col = calls_duration_col if (calls_duration_col and calls_duration_col in df_calls.columns) else _detect_col(df_calls, _CALL_DUR_COLS)
                 c_status_col = _detect_col(df_calls, _CALL_STATUS_COLS)
                 c_agent_col = _detect_col(df_calls, _CALL_AGENT_COLS)
@@ -2145,7 +2151,11 @@ def export_analytics_html(results: Dict[str, Any]) -> str:
 def export_analytics_excel_bytes(results: Dict[str, Any]) -> bytes:
     """تصدير التقرير الشامل في شيت واحد فقط بتنسيق RTL وأعمدة متناسقة"""
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+    with pd.ExcelWriter(
+        output,
+        engine="xlsxwriter",
+        engine_kwargs={"options": {"nan_inf_to_errors": True}}
+    ) as writer:
         workbook = writer.book
 
         hdr_fmt = workbook.add_format({
@@ -2195,7 +2205,8 @@ def export_analytics_excel_bytes(results: Dict[str, Any]) -> bytes:
                 is_last = is_total_last and row_idx == len(df) - 1
                 fmt = total_fmt if is_last else cell_fmt
                 for col_idx, val in enumerate(row.values):
-                    worksheet.write(current_row, col_idx, val, fmt)
+                    safe_val = "-" if (val is None or (isinstance(val, float) and (pd.isna(val) or val == float("inf") or val == float("-inf")))) else val
+                    worksheet.write(current_row, col_idx, safe_val, fmt)
                 current_row += 1
             current_row += 1
 
