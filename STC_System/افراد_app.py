@@ -335,6 +335,16 @@ def run_afrad_app():
                 {"key": "calls", "label": "📞 ملف المكالمات الناجحة (.xlsx) - اختياري", "required": False}
             ]
         },
+        "salary_campaign": {
+            "name": "🚀 غرفة متابعة فترة الرواتب (أمس + التراكمي)",
+            "desc": "متابعة يومية لأداء المحصلين والمشرفين في أسبوع الرواتب (من 26 إلى 5): تغطية وتحصيل أمس + التراكمي، وتجهيز شيتات المتابعة لكل مشرف والمحفظة المحللة للمدير.",
+            "id": 15,
+            "files": [
+                {"key": "portfolio", "label": "ملف محفظة العملاء الإيجابيين (.xlsx) *", "required": True},
+                {"key": "payments", "label": "ملف التحصيل / السدادات (.xlsx) - اختياري", "required": False},
+                {"key": "calls", "label": "📞 ملف المكالمات الفعلية (.xlsx) - اختياري", "required": False}
+            ]
+        },
         "electronic": {
             "name": "💻 التحصيل الإلكتروني",
             "desc": "تحليل أداء التحصيل الإلكتروني وعرض نسب التغطية والتوصل مع إمكانية التصفية حسب الفرع والمشرف وبناء ملخص بناءً على الـ Segment ونوع الخدمة.",
@@ -1382,6 +1392,52 @@ def run_afrad_app():
                 except Exception as _e_scan:
                     st.warning(f"⚠️ تعذّر قراءة أعمدة شيت المكالمات: {_e_scan}")
 
+        # ─── إعدادات غرفة متابعة فترة الرواتب ───
+        sal_params = {}
+        if selected_key == "salary_campaign":
+            from datetime import date as _dt_date
+            _yest_def = _dt_date.today() - timedelta(days=1)
+            if _yest_def.day >= 26:
+                _cs_def = _yest_def.replace(day=26)
+            else:
+                _prev_m = _yest_def.replace(day=1) - timedelta(days=1)
+                _cs_def = _prev_m.replace(day=26)
+            _ce_def = _dt_date(_cs_def.year + 1, 1, 5) if _cs_def.month == 12 else _dt_date(_cs_def.year, _cs_def.month + 1, 5)
+
+            st.markdown("🚀 **إعدادات متابعة فترة الرواتب (أمس + التراكمي):**")
+            sc1, sc2, sc3 = st.columns(3)
+            with sc1:
+                sal_rep_dt = st.date_input("📅 تاريخ التقرير (أمس):", value=_yest_def, key="sal_rep_dt")
+            with sc2:
+                sal_start_dt = st.date_input("🟢 بداية الحملة (يوم 26):", value=_cs_def, key="sal_start_dt")
+            with sc3:
+                sal_end_dt = st.date_input("🏁 نهاية الحملة (يوم 5):", value=_ce_def, key="sal_end_dt")
+
+            st.markdown("🎯 **تحديد المستهدفات اليومية ومستهدف الحملة لكل محصل:**")
+            st1, st2, st3, st4 = st.columns(4)
+            with st1:
+                sal_d_cov = st.number_input("📞 مستهدف التغطية اليومي (عميل/يوم):", min_value=1, value=50, step=5, key="sal_d_cov")
+            with st2:
+                sal_d_pay = st.number_input("💵 مستهدف التحصيل اليومي (﷼/يوم):", min_value=0.0, value=5000.0, step=500.0, key="sal_d_pay")
+            with st3:
+                sal_tgt = st.number_input("🏆 مستهدف الحملة الكلي للمحصل (﷼):", min_value=0.0, value=50000.0, step=5000.0, key="sal_tgt")
+            with st4:
+                sal_d_calls = st.number_input(
+                    "☎️ مستهدف المكالمات الناجحة (مكالمة):",
+                    min_value=1, value=25, step=5, key="sal_d_calls",
+                    help="يُستخدم تلقائياً عند إرفاق شيت المكالمات"
+                )
+
+            sal_params = {
+                "report_date": sal_rep_dt.strftime("%Y-%m-%d") if sal_rep_dt else None,
+                "campaign_start": sal_start_dt.strftime("%Y-%m-%d") if sal_start_dt else None,
+                "campaign_end": sal_end_dt.strftime("%Y-%m-%d") if sal_end_dt else None,
+                "collection_target": float(sal_tgt),
+                "daily_coverage_target": float(sal_d_cov),
+                "daily_collection_target": float(sal_d_pay),
+                "daily_calls_target": float(sal_d_calls),
+            }
+
         # ─── التحقق من الجاهزية ───
         ready_to_run = True
         for fspec in module_info["files"]:
@@ -1445,7 +1501,7 @@ def run_afrad_app():
                     out_fd, out_path = tempfile.mkstemp(suffix=".xlsx")
                     os.close(out_fd)
                     temp_files.append(out_path)
-                    writer = ExcelReportWriter(out_path) if task_id != 14 else None
+                    writer = ExcelReportWriter(out_path) if task_id not in [14, 15] else None
 
                     if task_id == 1:
                         from modules.module1_errors import SystemErrorsModule
@@ -1620,7 +1676,28 @@ def run_afrad_app():
                         with open(out_path, "wb") as f_pa:
                             f_pa.write(pa_excel_data)
 
-                    if task_id not in [10, 12, 14] and writer:
+                    elif task_id == 15:
+                        from modules.module15_salary_campaign import (
+                            SalaryCampaignModule, export_salary_report_excel
+                        )
+                        r = SalaryCampaignModule().run(
+                            portfolio=portfolio,
+                            payments=dfs.get("payments"),
+                            calls=dfs.get("calls"),
+                            report_date=sal_params.get("report_date"),
+                            campaign_start=sal_params.get("campaign_start"),
+                            campaign_end=sal_params.get("campaign_end"),
+                            collection_target=sal_params.get("collection_target", 50000.0),
+                            daily_coverage_target=sal_params.get("daily_coverage_target", 50.0),
+                            daily_collection_target=sal_params.get("daily_collection_target", 5000.0),
+                            daily_calls_target=sal_params.get("daily_calls_target", 25.0),
+                        )
+                        stats.update(r["stats"])
+                        sal_excel_data = export_salary_report_excel(r)
+                        with open(out_path, "wb") as f_sal:
+                            f_sal.write(sal_excel_data)
+
+                    if task_id not in [10, 12, 14, 15] and writer:
                         writer.write_dashboard(stats, task_id)
                         writer.write_summary(stats)
                         writer.save()
@@ -2175,7 +2252,40 @@ def run_afrad_app():
                                 st.markdown(f"**📋 القائمة الكاملة لكافة أعضاء فريق {sup_n}:**")
                                 st.dataframe(t_d["all_members"], use_container_width=True, hide_index=True)
 
-# ─── زر التحميل ───
+                # عرض نتائج غرفة متابعة فترة الرواتب (Module 15)
+                if task_id == 15 and 'r' in locals() and "collector_table" in r:
+                    import plotly.express as px
+                    st.markdown("---")
+                    st.markdown("## 🚀 لوحة متابعة فترة الرواتب (أمس + التراكمي)")
+
+                    sal_t1, sal_t2, sal_t3, sal_t4 = st.tabs([
+                        "👥 ملخص المشرفين",
+                        "🧑‍💼 أداء المحصلين (أمس + التراكمي)",
+                        "🔥 وعود سداد لم تُسدَّد",
+                        "📞 عملاء إيجابيين بدون تغطية"
+                    ])
+                    with sal_t1:
+                        sup_t = r.get("supervisor_table", pd.DataFrame())
+                        st.dataframe(sup_t, use_container_width=True, hide_index=True)
+                        if not sup_t.empty:
+                            fig_s = px.bar(
+                                sup_t, x="المشرف", y=["التغطية التراكمية", "المتبقي بدون تغطية"],
+                                title="📊 التغطية التراكمية مقابل المتبقي لكل مشرف",
+                                barmode="stack",
+                                color_discrete_map={"التغطية التراكمية": "#99CC00", "المتبقي بدون تغطية": "#262626"}
+                            )
+                            fig_s.update_layout(height=340, margin=dict(l=10, r=10, t=40, b=10))
+                            st.plotly_chart(fig_s, use_container_width=True)
+                    with sal_t2:
+                        st.dataframe(r.get("collector_table", pd.DataFrame()), use_container_width=True, hide_index=True)
+                    with sal_t3:
+                        st.caption("عملاء أعطوا وعد بالسداد في الحملة ولم يظهر لهم سداد حتى تاريخ التقرير — أولوية الاتصال الصباحي:")
+                        st.dataframe(r.get("unpaid_promises_df", pd.DataFrame()), use_container_width=True, hide_index=True)
+                    with sal_t4:
+                        st.caption("عملاء إيجابيين لم تتم متابعتهم مطلقاً من بداية الحملة حتى تاريخ التقرير:")
+                        st.dataframe(r.get("uncovered_df", pd.DataFrame()), use_container_width=True, hide_index=True)
+
+                # ─── زر التحميل ───
                 with open(out_path, "rb") as f_out:
                     excel_bytes = f_out.read()
 
@@ -2221,6 +2331,37 @@ def run_afrad_app():
                             file_name=f"محفظة_stc_المحللة_{ts_str}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             disabled=(len(_port_xlsx_bytes) == 0),
+                            use_container_width=True
+                        )
+                elif task_id == 15 and 'r' in locals():
+                    from modules.module15_salary_campaign import (
+                        export_enriched_portfolio_excel, export_supervisor_action_zip
+                    )
+                    _sal_port_bytes = export_enriched_portfolio_excel(r)
+                    _sal_zip_bytes  = export_supervisor_action_zip(r)
+                    sd1, sd2, sd3 = st.columns(3)
+                    with sd1:
+                        st.download_button(
+                            label="📥 تحميل التقرير الشامل للإدارة (Excel)",
+                            data=excel_bytes,
+                            file_name=download_name,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+                    with sd2:
+                        st.download_button(
+                            label="📦 تنزيل ملفات المشرفين منفصلة (ZIP)",
+                            data=_sal_zip_bytes,
+                            file_name=f"توجيهات_المشرفين_{ts_str}.zip",
+                            mime="application/zip",
+                            use_container_width=True
+                        )
+                    with sd3:
+                        st.download_button(
+                            label="📊 تنزيل المحفظة المحللة للمدير (Excel)",
+                            data=_sal_port_bytes,
+                            file_name=f"محفظة_الرواتب_المحللة_{ts_str}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True
                         )
                 else:
